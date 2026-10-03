@@ -185,13 +185,20 @@ pub fn snapshot(raw: &str, report_deadline: Instant) -> Result<SessionSnapshot> 
     })?;
     let wait_deadline = (Instant::now() + Duration::from_secs(3)).min(report_deadline);
     loop {
-        let turns = parse_turns(&payload.transcript_path)?;
+        let content = std::fs::read_to_string(&payload.transcript_path).with_context(|| {
+            format!(
+                "failed to read transcript {}",
+                payload.transcript_path.display()
+            )
+        })?;
+        let turns = turns_from_lines(&content);
         if turns
             .last()
             .is_some_and(|turn| !turn.is_empty() && turn.response.is_some())
             || Instant::now() >= wait_deadline
         {
             return Ok(SessionSnapshot {
+                title: session_title(&content, &payload.session_id),
                 session_id: payload.session_id,
                 turns,
             });
@@ -204,17 +211,33 @@ fn preview(raw: &str) -> String {
     raw.chars().take(200).collect()
 }
 
-pub fn parse_turns(path: &Path) -> Result<Vec<Turn>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read transcript {}", path.display()))?;
-    Ok(turns_from_lines(&content))
+fn session_title(content: &str, session_id: &str) -> Option<String> {
+    let mut custom = None;
+    let mut generated = None;
+    for line in content.lines() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record["sessionId"].as_str() != Some(session_id) {
+            continue;
+        }
+        let (target, field) = match record["type"].as_str() {
+            Some("custom-title") => (&mut custom, "customTitle"),
+            Some("ai-title") => (&mut generated, "aiTitle"),
+            _ => continue,
+        };
+        if let Some(title) = record[field].as_str() {
+            *target = nonempty(title);
+        }
+    }
+    custom.or(generated)
 }
 
 fn turns_from_lines(content: &str) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut owners: HashMap<String, usize> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut calls: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut calls: HashMap<String, (usize, usize, bool, DateTime<Utc>)> = HashMap::new();
     let mut tools: HashMap<String, (usize, usize)> = HashMap::new();
     let mut fallback_turns: HashSet<usize> = HashSet::new();
     let mut previous_at: Option<DateTime<Utc>> = None;
@@ -226,6 +249,9 @@ fn turns_from_lines(content: &str) -> Vec<Turn> {
         let Some(entry) = parse_entry(line) else {
             continue;
         };
+        if matches!(entry.kind.as_str(), "ai-title" | "custom-title") {
+            continue;
+        }
         if let (Some(uuid), Some(parent)) = (&entry.uuid, &entry.parent_uuid) {
             parents.insert(uuid.clone(), parent.clone());
         }
@@ -409,7 +435,7 @@ struct PendingAssistant {
 
 struct AssistantIndexes<'a> {
     owners: &'a mut HashMap<String, usize>,
-    calls: &'a mut HashMap<String, (usize, usize)>,
+    calls: &'a mut HashMap<String, (usize, usize, bool, DateTime<Utc>)>,
     tools: &'a mut HashMap<String, (usize, usize)>,
     fallback_turns: &'a mut HashSet<usize>,
 }
@@ -451,26 +477,56 @@ fn attach_assistant(
     }
     if let Some(call) = entry.llm_call(started_at, ended_at) {
         let call_id = call.uuid.clone();
-        let call_owner = if let Some(&(old_owner, call_index)) = calls.get(&call_id) {
-            turns[old_owner].calls[call_index] = call;
-            turns[old_owner].ended_at = turns[old_owner].ended_at.max(ended_at);
-            if entry.is_completed_response() {
-                turns[old_owner].response = entry.assistant_text();
-            }
-            old_owner
-        } else {
-            let turn = &mut turns[owner];
-            if turn.started_at == DateTime::<Utc>::UNIX_EPOCH {
-                turn.started_at = started_at;
-            }
-            turn.ended_at = turn.ended_at.max(ended_at);
-            if entry.is_completed_response() {
-                turn.response = entry.assistant_text();
-            }
-            calls.insert(call_id.clone(), (owner, turn.calls.len()));
-            turn.calls.push(call);
-            owner
-        };
+        let final_observation = entry
+            .message
+            .as_ref()
+            .and_then(|m| m.stop_reason.as_ref())
+            .is_some();
+        let call_owner =
+            if let Some(&(old_owner, call_index, old_final, observed_at)) = calls.get(&call_id) {
+                let existing = &mut turns[old_owner].calls[call_index];
+                let first_at = existing.started_at.min(call.started_at);
+                let last_at = existing.ended_at.max(call.ended_at);
+                let conflicting = existing
+                    .accounting
+                    .as_ref()
+                    .is_some_and(|a| a.conflicting_observations)
+                    || (old_final
+                        && final_observation
+                        && usage_signature(existing) != usage_signature(&call));
+                if (final_observation, ended_at) >= (old_final, observed_at) {
+                    *existing = call;
+                    calls.insert(
+                        call_id.clone(),
+                        (old_owner, call_index, final_observation, ended_at),
+                    );
+                }
+                if let Some(accounting) = &mut existing.accounting {
+                    accounting.conflicting_observations = conflicting;
+                }
+                existing.started_at = first_at;
+                existing.ended_at = last_at;
+                turns[old_owner].ended_at = turns[old_owner].ended_at.max(ended_at);
+                if entry.is_completed_response() {
+                    turns[old_owner].response = entry.assistant_text();
+                }
+                old_owner
+            } else {
+                let turn = &mut turns[owner];
+                if turn.started_at == DateTime::<Utc>::UNIX_EPOCH {
+                    turn.started_at = started_at;
+                }
+                turn.ended_at = turn.ended_at.max(ended_at);
+                if entry.is_completed_response() {
+                    turn.response = entry.assistant_text();
+                }
+                calls.insert(
+                    call_id.clone(),
+                    (owner, turn.calls.len(), final_observation, ended_at),
+                );
+                turn.calls.push(call);
+                owner
+            };
         if entry.is_completed_response() && fallback_turns.remove(&call_owner) {
             let identity = format!("assistant:{call_id}");
             turns[call_owner].uuid = identity.clone();
@@ -480,6 +536,15 @@ fn attach_assistant(
     if let Some(uuid) = &entry.uuid {
         owners.insert(uuid.clone(), owner);
     }
+}
+
+fn usage_signature(call: &LlmCall) -> (u64, u64, u64, u64) {
+    (
+        call.input_tokens,
+        call.output_tokens,
+        call.cache_read_tokens,
+        call.cache_creation_tokens,
+    )
 }
 
 fn ancestry_related(assistant: &Entry, leaf_uuid: &str, parents: &HashMap<String, String>) -> bool {
@@ -531,12 +596,16 @@ struct Entry {
     is_sidechain: bool,
     timestamp: Option<DateTime<Utc>>,
     message: Option<Message>,
+    #[serde(rename = "requestId")]
+    request_id: Option<String>,
     #[serde(rename = "lastPrompt")]
     last_prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Message {
+    id: Option<String>,
+    provider: Option<String>,
     model: Option<String>,
     content: Option<serde_json::Value>,
     usage: Option<Usage>,
@@ -553,9 +622,34 @@ struct Usage {
     cache_read_input_tokens: u64,
     #[serde(default)]
     cache_creation_input_tokens: u64,
+    cache_creation: Option<CacheCreation>,
+    speed: Option<String>,
+    service_tier: Option<String>,
+    inference_geo: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheCreation {
+    ephemeral_5m_input_tokens: Option<u64>,
+    ephemeral_1h_input_tokens: Option<u64>,
 }
 
 impl Entry {
+    fn call_identity(&self) -> Option<String> {
+        let message = self.message.as_ref()?;
+        match (self.request_id.as_deref(), message.id.as_deref()) {
+            (Some(request), Some(message)) => Some(format!(
+                "provider:{}",
+                uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_OID,
+                    format!("{request}\0{message}").as_bytes()
+                )
+            )),
+            (_, Some(message)) => Some(format!("message:{message}")),
+            _ => self.uuid.clone(),
+        }
+    }
+
     fn stable_identity(&self, line_index: usize) -> String {
         self.uuid
             .as_ref()
@@ -604,14 +698,42 @@ impl Entry {
     fn llm_call(&self, started_at: DateTime<Utc>, ended_at: DateTime<Utc>) -> Option<LlmCall> {
         let message = self.message.as_ref()?;
         let usage = message.usage.as_ref()?;
+        if message
+            .model
+            .as_deref()
+            .is_some_and(|model| model.starts_with('<'))
+        {
+            return None;
+        }
         Some(LlmCall {
-            uuid: self.uuid.clone()?,
-            provider: "anthropic".to_string(),
+            uuid: self.call_identity()?,
+            provider: message
+                .provider
+                .clone()
+                .filter(|p| !p.trim().is_empty())
+                .unwrap_or_else(|| "unknown".into()),
             model: message.model.clone().unwrap_or_else(|| "unknown".into()),
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cache_read_tokens: usage.cache_read_input_tokens,
             cache_creation_tokens: usage.cache_creation_input_tokens,
+            accounting: Some(nasiko_types::CodingAgentCallAccounting {
+                version: 2,
+                request_id: self.request_id.clone(),
+                message_id: message.id.clone(),
+                cache_creation_5m_tokens: usage
+                    .cache_creation
+                    .as_ref()
+                    .and_then(|c| c.ephemeral_5m_input_tokens),
+                cache_creation_1h_tokens: usage
+                    .cache_creation
+                    .as_ref()
+                    .and_then(|c| c.ephemeral_1h_input_tokens),
+                speed: usage.speed.clone(),
+                service_tier: usage.service_tier.clone(),
+                inference_geo: usage.inference_geo.clone(),
+                conflicting_observations: false,
+            }),
             started_at,
             ended_at,
         })
@@ -657,7 +779,7 @@ impl Entry {
         if self.kind != "assistant" {
             return Vec::new();
         }
-        let model_call_id = self.uuid.clone();
+        let model_call_id = self.call_identity();
         self.message
             .as_ref()
             .and_then(|message| message.content.as_ref())
@@ -743,6 +865,102 @@ mod tests {
     use super::*;
 
     const USAGE: &str = r#""usage":{"input_tokens":1,"output_tokens":2}"#;
+
+    #[test]
+    fn capture_uses_one_final_observation_not_independent_maxima() {
+        let user = json!({"type":"user","uuid":"user","timestamp":"2026-01-01T00:00:00Z","message":{"content":"hello"}});
+        let partial = json!({"type":"assistant","uuid":"partial","parentUuid":"user","requestId":"request", "timestamp":"2026-01-01T00:00:03Z", "message":{"id":"message","model":"claude-test","usage":{"input_tokens":90,"output_tokens":1}}});
+        let final_record = json!({"type":"assistant","uuid":"final","parentUuid":"user","requestId":"request", "timestamp":"2026-01-01T00:00:02Z", "message":{"id":"message","model":"claude-test","content":"done","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":7,"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":5}}}});
+        for content in [
+            format!("{user}\n{partial}\n{final_record}"),
+            format!("{user}\n{final_record}\n{partial}"),
+        ] {
+            let turns = turns_from_lines(&content);
+            let calls: Vec<_> = turns.iter().flat_map(|t| &t.calls).collect();
+            assert_eq!(calls.len(), 1);
+            assert_eq!((calls[0].input_tokens, calls[0].output_tokens), (10, 5));
+            assert_eq!(calls[0].provider, "unknown");
+            assert_eq!(
+                calls[0]
+                    .accounting
+                    .as_ref()
+                    .unwrap()
+                    .cache_creation_1h_tokens,
+                Some(5)
+            );
+        }
+        let mut retry = final_record.clone();
+        retry["uuid"] = "retry".into();
+        retry["requestId"] = "different-request".into();
+        let turns = turns_from_lines(&format!("{user}\n{final_record}\n{retry}"));
+        assert_eq!(turns.iter().map(|t| t.calls.len()).sum::<usize>(), 2);
+    }
+
+    #[test]
+    fn title_uses_latest_generated_record_for_matching_session() {
+        let records = concat!(
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Old\",\"sessionId\":\"s\"}\n",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Debug integration\",\"sessionId\":\"s\"}\n",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Other\",\"sessionId\":\"other\"}\n",
+            "{\"type\":\"ai-title\",\"aiTitle\":false,\"sessionId\":\"s\"}\n",
+            "{incomplete",
+        );
+        assert_eq!(
+            session_title(records, "s").as_deref(),
+            Some("Debug integration")
+        );
+        assert!(session_title(records, "missing").is_none());
+        assert!(session_title("", "s").is_none());
+    }
+
+    #[test]
+    fn custom_title_wins_until_cleared_without_reviving_old_titles() {
+        let records = concat!(
+            "{\"type\":\"custom-title\",\"customTitle\":\"  Custom name  \",\"sessionId\":\"s\"}\n",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Generated\",\"sessionId\":\"s\"}\n",
+        );
+        assert_eq!(session_title(records, "s").as_deref(), Some("Custom name"));
+        let cleared = format!(
+            "{records}{}\n",
+            r#"{"type":"custom-title","customTitle":"  ","sessionId":"s"}"#
+        );
+        assert_eq!(session_title(&cleared, "s").as_deref(), Some("Generated"));
+        let all_cleared = format!(
+            "{cleared}{}\n",
+            r#"{"type":"ai-title","aiTitle":"","sessionId":"s"}"#
+        );
+        assert!(session_title(&all_cleared, "s").is_none());
+    }
+
+    #[test]
+    fn title_records_do_not_break_last_prompt_adjacency() {
+        let records = concat!(
+            "{\"type\":\"user\",\"uuid\":\"u\",\"message\":{\"content\":\"hello\"}}\n",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Generated\",\"sessionId\":\"s\"}\n",
+            "{\"type\":\"last-prompt\",\"lastPrompt\":\"hello\",\"sessionId\":\"s\"}\n",
+        );
+        let turns = turns_from_lines(records);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].uuid, "u");
+    }
+
+    #[test]
+    fn snapshot_reads_title_and_turns_from_same_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let records = concat!(
+            "{\"type\":\"user\",\"uuid\":\"u\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":\"hello\"}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"a\",\"parentUuid\":\"u\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{\"model\":\"test\",\"content\":\"done\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Debug integration\",\"sessionId\":\"s\"}\n",
+        );
+        std::fs::write(&path, records).unwrap();
+        let payload = json!({"session_id": "s", "transcript_path": path}).to_string();
+        let snapshot = snapshot(&payload, Instant::now()).unwrap();
+        assert_eq!(snapshot.title.as_deref(), Some("Debug integration"));
+        assert_eq!(snapshot.turns.len(), 1);
+        assert_eq!(snapshot.turns[0].uuid, "u");
+        assert_eq!(snapshot.turns[0].response.as_deref(), Some("done"));
+    }
 
     #[test]
     fn v3_hook_registration_is_idempotent_and_preserves_foreign_hooks() {

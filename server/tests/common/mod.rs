@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use nasiko_config::Config;
 use nasiko_runtime::{
     ContainerId, ContainerRuntime, DeploymentSpec, DeploymentStatus, InstanceInfo,
-    Result as RuntimeResult, RuntimeState,
+    Result as RuntimeResult, RuntimeState, WorkspaceEntry, WorkspaceFile, WorkspaceRef,
 };
 use nasiko_server::state::AppState;
 use sqlx::PgPool;
@@ -46,6 +46,10 @@ pub struct FakeRuntime {
     /// When set, `deploy` fails instead of succeeding — lets a test exercise
     /// a genuine (post-build) deploy failure without a real runtime.
     fail_deploy: std::sync::atomic::AtomicBool,
+    /// Stands in for agents' persistent `/workspace`, keyed by
+    /// `{subpath}/{rel_path}` so a test can prove the server scoped a read to
+    /// the right agent rather than just echoing back what it asked for.
+    workspace: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
 }
 
 impl FakeRuntime {
@@ -53,6 +57,17 @@ impl FakeRuntime {
     #[allow(dead_code)]
     pub fn set_instances(&self, instances: Vec<InstanceInfo>) {
         *self.instances.lock().unwrap() = instances;
+    }
+
+    /// Put a file in an agent's fake persistent storage.
+    #[allow(dead_code)]
+    pub fn put_workspace_file(&self, workspace: &WorkspaceRef, rel_path: &str, body: &[u8]) {
+        // Key on the *scoped* subpath so a test can seed files under a specific
+        // user's `u/<token>` subtree, mirroring the real runtimes.
+        self.workspace
+            .lock()
+            .unwrap()
+            .insert(format!("{}/{rel_path}", workspace.subpath()), body.to_vec());
     }
 
     /// Make the next (and all subsequent) `deploy` calls fail instead of
@@ -138,6 +153,49 @@ impl ContainerRuntime for FakeRuntime {
     // hours-meter reconciler observes.
     async fn list_instances(&self) -> RuntimeResult<Vec<InstanceInfo>> {
         Ok(self.instances.lock().unwrap().clone())
+    }
+
+    // Explicit impls (not the trait defaults, which are "empty" and
+    // "unsupported") so a test can prove the server reached the runtime and
+    // scoped the read to one agent's subdirectory.
+    async fn list_workspace(&self, w: &WorkspaceRef) -> RuntimeResult<Vec<WorkspaceEntry>> {
+        let prefix = format!("{}/", w.subpath());
+        Ok(self
+            .workspace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(key, body)| {
+                Some(WorkspaceEntry {
+                    path: key.strip_prefix(&prefix)?.to_owned(),
+                    size: body.len() as u64,
+                    mtime: 0,
+                })
+            })
+            .collect())
+    }
+
+    async fn read_workspace_file(
+        &self,
+        w: &WorkspaceRef,
+        rel_path: &str,
+    ) -> RuntimeResult<WorkspaceFile> {
+        let key = format!("{}/{rel_path}", w.subpath());
+        let body = self
+            .workspace
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| {
+                nasiko_runtime::RuntimeError::Internal(format!("no such file: {rel_path}"))
+            })?;
+        Ok(WorkspaceFile {
+            size: body.len() as u64,
+            stream: Box::pin(futures::stream::once(async move {
+                Ok(bytes::Bytes::from(body))
+            })),
+        })
     }
 }
 
@@ -255,7 +313,13 @@ impl TestServer {
         let auth: Arc<dyn nasiko_auth::AuthService> =
             Arc::new(nasiko_auth::AuthServiceImpl::new(db.clone(), jwt_secret));
 
-        let state = AppState::from_config_with_db(config, auth, runtime, db.clone()).await;
+        // Integration tests run against the S3-compatible store `just infra`
+        // brings up, which is also the only backend this edition ships.
+        let oci_storage: Arc<dyn nasiko_runtime::BlobStore> = Arc::new(
+            nasiko_oci::storage::S3Storage::from_env(config.oci_storage_bucket.clone()).await,
+        );
+        let state =
+            AppState::from_config_with_db(config, auth, runtime, oci_storage, db.clone()).await;
 
         let app = nasiko_server::build_app(state, fallback);
 
@@ -276,6 +340,7 @@ impl TestServer {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn cleanup(&self) {
         // Terminate connections to the test DB before dropping it.
         sqlx::query(&format!(
@@ -324,6 +389,7 @@ fn test_config(db_url: String, redis_url: String, s3_endpoint: String) -> Config
         agent_runtime: "local".into(),
         k8s_namespace: "nasiko-test".into(),
         kubeconfig: None,
+        storage_provider: "s3".into(),
         s3_endpoint,
         s3_bucket: "nasiko-test".into(),
         s3_access_key: "nasiko".into(),
@@ -332,11 +398,15 @@ fn test_config(db_url: String, redis_url: String, s3_endpoint: String) -> Config
         secrets_encryption_key: "12345678901234567890123456789012".into(),
         oci_storage_bucket: "nasiko-test-artifacts".into(),
         agent_image_registry: String::new(),
+        agent_registry_username: None,
+        agent_registry_password: None,
         build_push_token: String::new(),
         seed_agents: None,
         openai_api_key: None,
         openai_base_url: None,
         openai_model: "gpt-4o".into(),
+        decomposer_api_url: None,
+        decomposer_api_key: None,
         router_model: "gpt-4o".into(),
         capability_generator_model: "gpt-4o".into(),
         mcp_description_model: "gpt-4o".into(),
@@ -353,32 +423,48 @@ fn test_config(db_url: String, redis_url: String, s3_endpoint: String) -> Config
         loki_url: "http://localhost:3100".into(),
         observability_enabled: false,
         tenant_id: None,
+        // Off in tests: both loops hit the network on their first tick.
+        model_catalog_sync_enabled: false,
         model_pricing_sync_enabled: false,
-        model_pricing_sync_interval_secs: 86_400,
         flow_max_depth: 5,
         flow_max_fan_out: 20,
         flow_max_tokens: 100_000,
         flow_timeout_secs: 120,
+        hitl_request_ttl_days: 7,
+        hitl_resume_poll_interval_secs: 5,
+        hitl_resume_recovery_interval_secs: 10 * 60,
+        hitl_resume_lease_minutes: 2,
+        hitl_resume_max_attempts: 3,
+        hitl_resume_retry_delay_secs: 2,
         github_client_id: None,
         github_client_secret: None,
-        oidc_issuer_url: None,
-        oidc_client_id: None,
-        oidc_client_secret: None,
-        oidc_redirect_uri: None,
-        oidc_allowed_redirect_origins: vec![],
-        oidc_scopes: "openid profile email".into(),
-        oidc_provider_label: "microsoft_entra".into(),
         router_shortlist_threshold: 15,
         router_shortlist_size: 10,
-        max_router_history_messages: 20,
         embedding_model: "text-embedding-3-small".into(),
-        router_agent_timeout_secs: 60,
+        agent_call_timeout_secs: 600,
+        pacms_history_pool_size: 150,
+        savings_factor_refresh_secs: 86_400,
+        savings_factor_min_samples: 1_600,
+        savings_factor_window_days: 30,
+        react_compress_enabled: false,
+        react_compress_min_bytes: 2048,
+        history_compress_enabled: false,
+        history_compress_min_bytes: 2048,
+        pacms_budget_low: 500,
+        pacms_budget_medium: 1000,
+        pacms_budget_high: 5000,
+        pacms_history_mandatory_recent: 3,
+        context_k_low: 1,
+        context_k_medium: 5,
+        context_k_high: 20,
         github_callback_url: None,
         github_central_callback_url: None,
-        oidc_central_callback_url: None,
         docker_agent_network: None,
         oci_registry_host: None,
         container_hours_poll_secs: 0, // disabled so the background loop never races tests driving reconcile_once directly
+        trace_usage_sync_secs: 0,
+        trace_usage_overlap_secs: 600,
+        trace_usage_batch_size: 50,
         git_clone_allowed_hosts: vec![
             "github.com".to_owned(),
             "gitlab.com".to_owned(),
@@ -386,6 +472,14 @@ fn test_config(db_url: String, redis_url: String, s3_endpoint: String) -> Config
         ],
         registry_import_allowed_hosts: vec![],
         cors_allowed_origins: vec![],
+        oidc_issuer_url: None,
+        oidc_client_id: None,
+        oidc_client_secret: None,
+        oidc_redirect_uri: None,
+        oidc_allowed_redirect_origins: vec![],
+        oidc_scopes: "".to_string(),
+        oidc_provider_label: "".to_string(),
+        oidc_central_callback_url: None,
         admin_username: "admin".into(),
         admin_password: "test-admin-password".into(),
         // Overridable so tests can point the Composio ToolProvider at a mockito
@@ -421,16 +515,22 @@ fn test_config(db_url: String, redis_url: String, s3_endpoint: String) -> Config
         mcp_servers_network: "nasiko-mcp-servers-net".to_string(),
         mcp_upload_max_replicas: 1,
         agent_max_replicas: 1,
+        // Serial builds in tests: several suites seed build_jobs rows and assert
+        // on them, and a concurrent worker would make those assertions racy.
+        build_concurrency: 1,
         agent_default_memory: "512Mi".to_string(),
         agent_memory_volume: "nasiko-agent-memory".to_string(),
         agent_memory_init_image: "alpine:3.21".to_string(),
         mcp_toolcount_ttl_seconds: 3600,
         seed_toolkits: vec![],
+        mcp_tool_search_mode: "".to_string(),
+        mcp_tool_search_tool_limit: 0,
         app_base_url: "".to_string(),
         // Single-tenant test config — multi-tenant admission + CP-cookie paths off.
         multi_tenant_mode: false,
         allow_personal_emails: false,
         nasiko_bff_url: None,
+        mcp_tool_search_meta_limit: 0,
     }
 }
 
@@ -489,6 +589,48 @@ pub fn as_member(
     username: &str,
 ) -> reqwest::RequestBuilder {
     rb.bearer_auth(sign_token(user_id, username, false, "member"))
+}
+
+// ─── MCP gateway auth test helpers (docs/MCP_GATEWAY_AGENT_AUTH.md) ──────────
+
+/// Mint the agent's MCP gateway credential — the plaintext that deploy-time
+/// wiring injects into the container env as `MCP_GATEWAY_TOKEN`.
+#[allow(dead_code)]
+pub async fn mint_gateway_token(db: &sqlx::PgPool, agent_id: uuid::Uuid) -> String {
+    nasiko_mcp_gateway::agent_tokens::mint(db, agent_id)
+        .await
+        .expect("mint gateway token")
+}
+
+/// Open a live flow for `(user, agent)` exactly the way a dispatch path does —
+/// `flows` row + `flow_participants` record — and return `(flow_id,
+/// traceparent)`, where the traceparent is what the platform forwards to the
+/// agent (its trace id IS the flow id).
+#[allow(dead_code)]
+pub async fn open_flow(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+    agent_id: uuid::Uuid,
+) -> (String, String) {
+    let flow_id = uuid::Uuid::new_v4().simple().to_string();
+    sqlx::query(
+        "INSERT INTO flows (flow_id, user_id, root_agent_id, status, metadata)
+         VALUES ($1, $2, $3, 'running', '{}'::jsonb)",
+    )
+    .bind(&flow_id)
+    .bind(user_id)
+    .bind(agent_id)
+    .execute(db)
+    .await
+    .expect("insert flows row");
+    sqlx::query("INSERT INTO flow_participants (flow_id, agent_id) VALUES ($1, $2)")
+        .bind(&flow_id)
+        .bind(agent_id)
+        .execute(db)
+        .await
+        .expect("insert flow participant");
+    let traceparent = format!("00-{flow_id}-00f067aa0ba902b7-01");
+    (flow_id, traceparent)
 }
 
 /// Attach HTTP Basic auth — the credential type the OCI registry's pull-only

@@ -1138,6 +1138,14 @@ pub struct AgentRecord {
     pub id: String,
     #[tabled(rename = "NAME")]
     pub name: String,
+    /// The server's human-facing label (e.g. "Claude Code (ankit@nasiko.com)")
+    /// — same string the web UI shows. `None` for agents registered before
+    /// the server started returning it. `name` above stays the real
+    /// identifier used everywhere else (chat targeting, resolution); this is
+    /// display-only, rendered by `cmd_ls` in place of `name` when present.
+    #[tabled(skip)]
+    #[serde(default)]
+    pub display_name: Option<String>,
     #[tabled(rename = "STATUS", display = "opt_dash")]
     #[serde(default)]
     pub status: Option<String>,

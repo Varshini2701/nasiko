@@ -66,6 +66,9 @@ pub(crate) async fn persist_external_turn(
             && assistant_message.content == body.assistant_content
             && assistant_message.input_tokens == usage.and_then(|u| u.input_tokens)
             && assistant_message.output_tokens == usage.and_then(|u| u.output_tokens)
+            && assistant_message.cache_read_tokens == usage.and_then(|u| u.cache_read_tokens)
+            && assistant_message.cache_creation_tokens
+                == usage.and_then(|u| u.cache_creation_tokens)
             && assistant_message.model.as_deref() == usage.and_then(|u| u.model.as_deref())
             && assistant_message.duration_ms == usage.and_then(|u| u.duration_ms)
             && assistant_message.cost_usd == usage.and_then(|u| u.cost_usd)
@@ -87,8 +90,8 @@ pub(crate) async fn persist_external_turn(
         r#"INSERT INTO chat_messages
                (session_id, external_turn_id, role, content, timestamp,
                 input_tokens, output_tokens, model, duration_ms, cost_usd,
-                 usage_estimated, trace_id, metadata)
-            VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 usage_estimated, trace_id, metadata, cache_read_tokens, cache_creation_tokens)
+            VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
            ON CONFLICT (session_id, external_turn_id, role) DO NOTHING
            RETURNING *"#,
     )
@@ -104,6 +107,8 @@ pub(crate) async fn persist_external_turn(
     .bind(usage.and_then(|u| u.estimated))
     .bind(usage.and_then(|u| u.trace_id.as_deref()))
     .bind(assistant_metadata.as_ref())
+    .bind(usage.and_then(|u| u.cache_read_tokens))
+    .bind(usage.and_then(|u| u.cache_creation_tokens))
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(PersistExternalTurnError::Incomplete)?;

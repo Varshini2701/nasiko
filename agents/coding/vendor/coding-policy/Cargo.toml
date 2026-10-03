@@ -1,0 +1,12 @@
+[package]
+name = "nasiko-coding-policy"
+version = "0.1.0"
+edition = "2024"
+
+# A real root-workspace member — oss/server depends on it directly to inject
+# the minimal-code ladder at A2A dispatch time. Vendored agents (vendor/
+# coding-policy/) are unaffected: sync-vendor.sh already strips any
+# `[workspace]` line before copying, since a vendored copy is nested inside
+# its own dependent agent's own workspace root instead.
+
+[dependencies]

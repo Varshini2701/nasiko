@@ -1,0 +1,1957 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "DeploymentStatus",
+  "metadata": {
+    "name": "agent-router",
+    "generation": 42
+  },
+  "replicas": 120,
+  "readyReplicas": 119,
+  "updatedReplicas": 120,
+  "pods": [
+    {
+      "name": "agent-router-7d9f4b-0000",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-10T00:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:d23f0824128b2f330c5c7fd0a6a3a4506513270e269e0d37f2a74de452e6b438",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:36f675cc81e74ef5e8e25d940ed904759531985d5d9dc9f81818e811892f902b"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0001",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-11T01:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:8d116ece1738f7d93d9c172411e20b8f6b0d549b6f03675a1600a35a099950d8",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:a170b33839263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a26"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0002",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-12T02:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:0cb1e29c658cda1495e60af593bd04cf0fd630f1f29d0da9953f48f1a09f76b5",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:6b4cb2424a23d5962217beaddbc496cb8e81973e0becd7b03898d190f9ebdacc"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0003",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-13T03:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:ae97ba94d0eda82f8f6d05584ef8aa38922766581e27a1c08a6a63ec24ede6a4",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:18f135d25f557203301850c5a38fd547923a736994e3bf911a61dbe22e44158b"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0004",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-14T04:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:7f15052434b9b5df9e7769b10f4205b4907a70c31012f037b64ce4228c38fb29",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:ec66a78795e761d17731af10506bf2efc6f877186d76b07e881ed162ae2eb154"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0005",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-15T05:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:c7a2ea20b2f14c942e05319acb5c74273f98e2774cbd87ad5c90a9587403e430",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:57ee05cde00902c77ebff206867347214cdd2055930d6eaf14f4733f3e7d1bfb"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0006",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-16T06:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:830e07bc1e398f1012bd4acefaecbd389be4bcfc49b64a0872e6cc3ababced20",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:6bf46c697d2caf82eeeacbe226e875555790f82ec1d3fcff2a3af4d46b0a18e8"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0007",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-10T07:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:ca02135e92b1d3f28ede0d7ac3baea9e13deef86ab1031d0f646e1f40a097c97",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:7f26144b98289fcd59a54a7bb1fee08f571242425051c1ccd17f9acae01f5057"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0008",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-11T08:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:451abd81f1d69ed617f5e837d70820fe119a72d174c9df6acc011cdd9474031b",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:4f426dcbb394fb36bb2d420f0f88080b10a3d6b2aa05e11ab2715945795e8229"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0009",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-12T09:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:b774eb5248db40af72158370d269a9a5ae658f33fe3b890b93f448b3a5aa3c81",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:5affb2297631a992f0ce583505c6af0758d5563dab2cd31ee315128862c33a4f"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-000a",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-13T00:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:49952399c4aaeac137dc76fb0f17a3007e62aa0a1df9fd789c6539382b0537e6",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:7f1b103cdf1582b0eab477d26415479c65dc9f503f63af83bd0561e6211c70cf"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-000b",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-14T01:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:230d977ee22571594720771f8ca8181166d2287672fdf2022a96fb1a14a0f9e7",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:fc891b4a6a50df4db4d66a3a47469a4d8cdb305fdd2e16096e36aab0d1bc52d9"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-000c",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-15T02:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:153e7c2a26a2c0bd3b1287fff52ddf5d616499c9e25a7605aec6f0245bd86d40",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:d4c28c2e7c26847f0316909e3bbbe9eaa8948c893b61867626bb7dbd2d1c9af0"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-000d",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-16T03:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:88daf4016b4013ef254b0c4e010c4759482c9cbc43435cc52eae05cf96d0cc5f",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:dbf4a8b2b0c4312d20203626f3fe39c0519088f590fbbd119c1caaf75e8766ed"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-000e",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-10T04:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:74e69a5d0dd27a65bd628881ad1b72dba7abe1c29e1a8ef4f341e07a83f73f16",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:8f2c6ec8cc4169a3ae3a2b7fdfe01893f3aed0b6c7ac1491def88334e647cb8f"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-000f",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-11T05:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:66836886a260cd0b7b45145c1a81682c64e50cad66237a0465e7e4236472f1a3",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:1c2442f9298cb3a570ccec313571810afc132d0d113db17d30cbc97d0fef7928"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0010",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-12T06:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:895fd7b326b94c7f9118bb16000f49c81a358ca00d75985d99c94309570dc195",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:353c631cdfd43f371200339d068739fa9d1de2a05d158a2ff2ee4e4519f9919c"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0011",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-13T07:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:9a2ef80f58ee8571f4998d7c4093f6dea268aa872607679d6050914a9d33a01c",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:fa529ba3fe3bfada7cf20724d953ee261d87cec31f7296ab7961fd925d39d0a8"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0012",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-14T08:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:bfeaa1551a28f7b324e4e25a15fc899e4fd58dbe7bdc968b7afb2c68774b15d7",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:842e7fc229540a6eb12aa1f6d42fddbb7a86f7a243c71b9abd87a86557b6fb7e"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0013",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-15T09:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:b0a844e52587be6b5c9bcf35873be078f3b7a50df373ca533488f87605e999f3",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:a49636a2fa7f0eab4c4f9b0687322e25c215a82a06ec41adea0575438b0d590b"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0014",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-16T00:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:e883a1d45de0099784b5a81842d87208d86f40f6b239f3c7174c77a2dd02de92",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:80b0c08bc77024208aa4248c8857f9a43908f227c59db9165b0ee76f2ac34446"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0015",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-10T01:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:c2216b02fc241d0bc9d488b1cfbf33609cfc865239194242a2eddbbd5464ecc2",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:cda6c6fdbd68516766934036d17e44973d4882a5ce5b2a9231f51707da45e18a"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0016",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-11T02:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:fd56a926076b3e36bb2313f55b06258e7e26f36a8483f8b8332dd3313a0b9965",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:9aea6429b1491e243192b7044259405278e4b98d4787f93bca44eb860726e25c"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0017",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-12T03:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:597a1ecffcf00fecb91ee9e5efe09f07cefe2a1f727d83495822cb77f4de2c08",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:785729763a12917c1a26f88938703800149e259b5d58c705f979d04af47aebdd"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0018",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-13T04:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:9c3a23cde67a9b75fc3947249fc2d0a17b8f2ab53451d0135675f6ad325b55dd",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:a4a45effccb573d95810d60ea72991b9e8c147437abec539007d1034d726c86b"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0019",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-14T05:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:b6246771c845007063771407e8e727891eb20109a91c2439d5ab8b4d15b40aeb",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:a2c68e45ca04c79f6f15b6ad2db3997fe39639be7a605a91330698a1c0093492"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-001a",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-15T06:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:7691b06f6555abfeb8c9817af8be8831f237e45acd02c5e116353d03551fd8f9",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:fe3c9c8f2b855c1f28aaca51b98c67c215bd448ff26149edbe4c5ce666c1494e"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-001b",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-16T07:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:a7e6529bce76e9f477216e9ee7a46309973f798626b1cffc070d710920859634",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:effddeeaa842bc19796f74adfaf55496988af3fbd39630d69c9011ef256badf9"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-001c",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-10T08:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:cca2a92b03a56cc1057a40b22188287e8c5c715f8c74fc1e27e9e06f59b44e92",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:23a5ef88ef02090bbfdefc1586ce03f91a4f44f9a6511445b9f3635cf88c422b"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-001d",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-11T09:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:072a98d23606defcdfb85c0dd37ee91531dec4f4df2a8b79fc8e80b36f0e2289",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:537409029620bf0dc38084a03d93fd4c804c25d64affdcd13678bc8d40783f0a"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-001e",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-12T00:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:bd6b881ae8f6e0bd0f977044218e0b7bd58dcdb46b4468068b5ab3ee4265bb31",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:844a7034e77ffe48d0a6ec179556585ea997f351754a09cde5cfedfa5a9196f0"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-001f",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-13T01:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:26debfdb8825ae562179b37d806c10b5e0cfab4ceaefc4d2d3bf6d016bae4b5b",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:9bca3cb72ee0289dc6c91b9270ac06acdf70301704c9d78d82b3359986048719"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0020",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-14T02:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:9e7d6b377936d536243d35702c1eea1f265974a7cc966f46c6aa7d550101b811",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:87ddaeb784b28054aead44b0537390e50fcf31ca8e752fdf1ece615db9a6442e"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0021",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-15T03:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:0e8bec948f6f915fe21b37ca1b29fc99c6c80e2bc8c614b27b8444d18e317041",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:73c1cd2c81f98b521905d591c5b2e75a0acd8be146e4099030f970583f9d52f9"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0022",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-16T04:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:535b6a437178ba0a1038f0b5e998d0eee4ddf9b9c28ee907072235c28fcd7f40",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:46f5a1b4b156d1ad330c16a3831d03bf9b2bd6c0816bee06f92e23399ccea098"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0023",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-10T05:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:3f665edef10637ce81fc069e7a609683ceaf4915888564e88216858f73ccef03",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:ec3b96054274a3ebed84e91ef132bf2de040015ce064a11485f1115bb2fff17b"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0024",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-11T06:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:6aa8b9e0231b3e14729135bdd70a39d133dcd77ff179f2d2e48b96628f3c4be3",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:6da79a873d9a8079abd0d7fb1292618550e40d54712ea6b36471fde41f229dd0"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0025",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-12T07:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:c6e50df2e5a3863e1f525265c8b007ee4d82feacab6286cd3672d6ae12b80aed",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:40cbacd0249a45845dbe3023a906922fa4b9a9c4b753a1eef08360852789d059"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0026",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-13T08:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:18189af4f3d74f82bf268ea03836e86577bd891ff7b103df23231e1ee2015522",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:3945336bd51b1815aaf719f3fd68373b29acf1a57cbd1f5ae28af60465f42986"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0027",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-14T09:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:6bd8c67656d050cd6760136783feb17bfe7b8ae46e7836a4b4d19ec12955d6f0",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:5685d62404fcd5555daf106db8dee081179a071e518ae4525b4b1b75321c5296"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0028",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-15T00:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:84768b8c54dd0ba5626467ba04a10547b401ba8570c1dca1756b72898dd63cb9",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:eb25f8a1fc2e6a591ce3bc0c10755c97f5f554ed83239ef54ba2e1619fb9af50"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0029",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-16T01:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:459c945c43fc052715850a031ad2d5f1e05b3e13f8c110fb3a828159c9d22950",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:d1dcec53212a8d9bc17a9262453bf4912e7a26e9c76c603fe7e8f9f60a227385"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-002a",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-10T02:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:67ec326a42343354f22d2882d1a89b37ad0c9bb6e9526a69d97e967b6c18d982",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:53b97377b34e8ece7e9ee51d9212824c83c8cb28eb4ed2e3895e8b6b263cfa5e"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-002b",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-11T03:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:e53169606ce193c22eefa279b02e3d8dccb1c51d0eba0ea84770a08716e6fec3",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:42b38755cd37880e16ac4191a26aa0ae044f1574f037afc644d82a531289bafa"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-002c",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-12T04:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:1f2642aadcded20443b30f66110e2cb638efbaebdb31ccd29bb183e11570266b",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:ea59679aed3a32a86af257488d959c31fe8ad4a156d2a68c02f4b342742a8063"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-002d",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-13T05:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:f02905313d0a270bb5a432cf86e3e7260b0f873b2114e0689f27f52c449274d2",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:eea7bb6433a715682e5f950c0ce5af69430b91ed2954ba5cf81e54dd1c0502c6"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-002e",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-14T06:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:721888ff4a3adf9934b3ff60c26e7a4287f53ddd4e14d571a0f096da4fdebbec",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:fe977c5604a65651cdbde74758d50f1b4540f4262d8ad8c0ac127e938005ce74"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-002f",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-15T07:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:fa6197748d118e3781728a07bbab27f604b8157d03edb92009758340401d68fb",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:a887ae221b35411b72723b9cef44c0d53ee4da5a7989e9d083a4e62930803889"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0030",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-16T08:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:e3838b9ed5a9422a8bc083117eb86c57a81100a16ea330a1a66d58b5d1a4c01e",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:3ac4da9afb81392137161c16b00fd7bb4ecadea281b62bb5f86664ae64a149f5"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0031",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-10T09:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:23c49caea2cf62baba958810b4ebf4b6e1c60aa3d510bb0432d90dcd57bb7d97",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:03a63966213bca7fd644de2f0dec6823fb5c9d5658f92deafd4bd030679a44dd"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0032",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-11T00:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:0e2ec40a29ca862d6e4505f5416e99b0e13e213ebdaaea00a01d616f121ae3e6",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:f88ede10aba8b9b38185797cdedb9109618177ffd75d6769aa4c5c6015a0cce6"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0033",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-12T01:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:2f733b05759eb5590b94af3a4b05e1aeb153d69c3e01aaa699498ac4482cc78e",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:54348156f637a4685d385e064363e5d900ed6b0272218fdc44df96ff28541424"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0034",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-13T02:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:e1e437b7f735efe608d180113e940bb452d31e1b8c0d0033fc2325a9f8fdd208",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:1579da0a61b2480c55d85e8d00460d692ed654115b49156137c60e984f3e885e"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0035",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-14T03:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:c6b789ef81365acc3f88af5933736dcca7f0c99e80b5244a4767e1fa79823eb2",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:963892a766465d2824d4589c16fa1421d129d06743a08f0617420e940144702b"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0036",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-15T04:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:15a0a8ae3b996870a1320b9d4de2f8ad4cb59aa705c22d3f64dbc8d30aaaaf81",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:e48e9e02a854c83427be9ab1c0236e49da6e6d8e8778f742f527b5c295e8c93e"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0037",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-16T05:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:b87e4e2b537d9128c3a9e88963b759f598b81c66e10c167dc8b6eaffb74b589b",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:250e7b34a4aa07b49e6397d4b96245d348bfcbcf264337987e834904fc173498"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0038",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-10T06:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:6de2fb1fa098d6918352bc85e456559cb70af5f2d5d5891fd329d65c0b35b1de",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:c0bbe6ed8614f504e8ee65a123a9a9da816b2332cfed943bb3783a7cbbddbb9b"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0039",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-11T07:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:afbc9ca9d38f8c45041dcd94cdff5a1cd01a914cd5be785a9187df42811e7616",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:a4946d15b17dd255f4c18226aed23b0fb6104b84e4907d49cc4793d795850e21"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-003a",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-12T08:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:f5a2d8795c57532ba31a49dd221265400ab7798807fa22f715c891ff3add6527",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:04d2be09a0b558640cfff0548efba442738e0b77d5f860c3606a0deb1adbce5d"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-003b",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-13T09:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:74fa941200d935344387ee7b7d42646f3e9b768fae4001e3880cb401a0506098",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:1789819f8902dafce5d9fe8180c2b5f1eeb89ff1bf8e51aa11f2d44dcc35e834"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-003c",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-14T00:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:cf28f65e408fc146794ec926bc9e28eabee8062610e8ad0186a74a63a8c7d9e0",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:3b1185d9348922d7c1a624dcbab5b3733c1ae91743fb9fbcd89c36b2130f27b2"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-003d",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-15T01:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:13a5397f61ef7bd1d874bc797e736d5f75d8d8a4f9c9c679a661f62cbd65680c",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:a1feb6249df2025f0bf7a4bdc458272f498dbfa8af06bcf7e91457db7aa068f1"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-003e",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-16T02:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:a6caf4a341023aed54ef125a25bda659998648e013d5316f32c32444a48c1d5c",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:7b7fec4b03312ead222930ae9158d4a89f03bc5a4dee4812b16107f1be437c7b"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-003f",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-10T03:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:37bac233b1330c3f197a14e2ac084ba5f8f659ac44ce4ab37c5d42dc0f877ae3",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:774510ca76f4251e491961a1843baee9b578909c4a7591f27d575d17acfb2d5e"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0040",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-11T04:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:4fc9e91833020ccd8c90473ee4c717fdfe48ef631e563408c4653cde776200b5",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:13932904757f1cba4a227f39047b2c107912ef4aefae5d4e15fa8b65fa6672cd"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0041",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-12T05:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:63087e5244c6b895fe749e67730f37f1fe9eb4adf7d5f12481b1c025d1e4d0a3",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:171e1a8c94db5f8f1319d42435f10300ee379c65f21201e4eaa3556c35b7e448"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0042",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-13T06:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:9a762d5421f267e25c0bb40ff3e6ca734305e98686292bb5bf5b411b24491df6",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:5d7cfed1b40de56d1cd86fc1e30966194791c2e9823d11eda1b501d6d1f9bdfe"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0043",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-14T07:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:28b88073065b8c3564e276027c73b6c9e04b0dcee5d00a4d7f7595b53b3bf4bf",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:ba28a6794d4ca9c767c98fb9736506ecae7c8f097ddfcbc9f3308ce500eb4e11"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0044",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-15T08:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:54d1ac6bd71961891ef3ea4450ea7da760487e15580dc5ab6a8ad9cb24056360",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:f09c0afb1ebb079465f456aad6cff718569908f6c0301b2153158ce400721f84"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0045",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-16T09:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:40d284064a327e2dbd6a996de6cd10f103003005b688b661321c1744ed2879c1",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:138efef996d4480fdeb67ae7ffb0dd9e63e1986964950dc210a25b195f49f0fc"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0046",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-10T00:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:47d7df790c5b4c59dab0792946709312c172b2986d94dd6dece807995c57722e",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:261f40dfef82d1a3a28cf7b1491e99f5a97766fbd5ad53600d36ce2c1a09a840"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0047",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-11T01:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:c5ef5cfb3099f27150cb407a82ce786f6fad79364406c053f895fc553fd3be98",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:c2fbd8a3cfdcc257076d490ae25f4b1c6d80de7cf4c73f2bc8ff1c385f93d180"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0048",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-12T02:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:34145e878c9a37518ddcf83cf0d1ab56e02f9a72e9d625c966692158a1826327",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:9d6b023f736b96a0692fd360bb7b738eeef795cd0caa761214a0b00bb835e8a5"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0049",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-13T03:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:e9729f3f0c89c0017c4ea6034944f2cede962a6da4fd57c523797d45c0aed9c5",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:4820823157fa49e56a34b37178e10e702bb71c682097798c8cd3e418ed4142ba"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-004a",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-14T04:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:67fd5499429a7079a71f11b2f9ee8bc8bd1e6912bd313bee41785bc64c3ac6fc",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:1ea7722864f54969ab3b74fe8eaca2887bb1d1244d039b723d1926aca7ef4f5d"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-004b",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-15T05:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:cfd3dd72e7ecfd0c8027a2a235372235133e6153296259c8a4a915d02ad64ce9",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:c25e114fff18fe335534a034e8009d9073f6e53d3853933d8ce621ef7f405bc8"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-004c",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-16T06:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:2cb8d14c173910e33e7c6567314197758c3ba85923bc91526d6b987a73309b95",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:cf321d634223b8aa5e49422a3d37664251bcd77a1751f5798e4dc3a3578a60d8"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-004d",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-10T07:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:6201a9d369ac0f03dee0a843bfe98f8c0524137fe322e96d33bf915791d277f2",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:c08a58d756947a7a452e704d607a473235c2e229862fe231beef67fb69f44612"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-004e",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-11T08:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:afcf0e77203943f65c327a6df7ba38b69304106e470b4fad7f867d5f0fe321ec",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:17b4834c37495c5ed93ff716dce47b21ca51e152a12f3a94877b55cb80de8b3e"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-004f",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-12T09:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:6e8cd94e7223c68aa5529b0566567bc4627292f83f9aa884e59409c145619fc0",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:209342ca05955fb9f7d17ebddf75c883d07884b7d94355414fe04802f435a573"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0050",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-13T00:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:f7e147fd79281c19cde347abe54c5de6c3813ce6b5a290616cd9e62a08411c07",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:ed9bf0b6ed448d4eee241c43643ab9e212b92a01000bb5f97d652135965132d6"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0051",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-14T01:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:c879b6633f9b6bb272ee6a2ef8e4cb5c77d8c569daff9a0b8721ecf8d359d07a",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:1be03df0ae9c78bdf8cd9ec385b9c09a26edf1bd27855798394afbe91bea705e"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0052",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-15T02:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:e5174ebdc3c9f7e3d8b4c831a5b89b2fb374fab6b8c3a4d2d34d1c0df1058667",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:202ab6fac844b8fd0059865a0a1fb43bc6e0673a8d2f29e715c2c81a75134107"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0053",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-16T03:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:f662222e4dc4ac8cb70ba858a53fddc9099f9c9feb7fe26b91c3098c3b8a27ba",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:c38b48a2b2d643a26ffb726aa2e3f93a873b99034075916ea060846c20c26f71"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0054",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-10T04:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:31135de9953857d7f18bde0e86417b604ce3b0cc1202952f197536b11cb4ba55",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:89980c5002ad9d2b004b7fd099df209bca5d5e7d393cbcdd42c927b9635956be"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0055",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-11T05:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:d6e3a71ea502e8a850fcc626f57d17094752919475efd233ff125eb44d307fe4",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:077ef32a3f3f37ea8c0856a43c19c31586ba22dd79ad89993e0b25cde23f03cc"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0056",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-12T06:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:31b1891a0593dba20e28b64f4eb19fcaa64f7613b4642ea4696c63d6f5ead065",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:3a53c17641db898e14c2732a6b86290ba5acd341aca99fd0e2856ec67f914286"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0057",
+      "namespace": "nasiko-agents",
+      "phase": "CrashLoopBackOff",
+      "restarts": 14,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-13T07:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:b221713908ba9bd97e318ad63a0ea6e15ec69be3ecd7570b6ca06496aad7c7c0",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": false,
+          "imageID": "sha256:01ba985a32b558fd6577bb54aebcb0aa5cc0ff066ba99d01b7e49f36568a8c29"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0058",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-14T08:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:7ee5e85734893498114340ff813fb5cdd85bbb6bbd37929d4ac7ccc3cc0c6682",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:7711b7573b16494331a59c4ad1ebd086c40f36094fcc9a5c334e51aff848a956"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0059",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-15T09:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:9fa40dd6f3b17af01be7f3cf4b80b828e3ab6283c2ae35d243d87a9738b079e1",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:e90fb6516ac26ae07c2c6a87392bc552e57f76912ff3c23c9c2f67237eea6fe1"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-005a",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-16T00:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:0dea6e4e64b9cb1cec032e6b25795c189844f476f2e2054d0e71597aaa50b96f",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:b5b94af30d456be06a56aac3245448c8989bc9dcf95fe8a0060c88043683d4bc"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-005b",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-10T01:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:506f68ace2328994b647e8a8e5ee4c91731bbc4164b0bb142f217e720f650638",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:30d0a2b8544940e12a66f913ee7d0ae2145103c7ff5e1d1f1cfb0a06bb93c8eb"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-005c",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-11T02:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:4fd3e758082a2f4d77b5abcbbf0e11e086592243ef95eee8a70828a72f7dba08",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:71436e1d54ea2061fc27d6835fb6d625d6d106fb60ed33a0b9b253e3aa181345"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-005d",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-12T03:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:6b911f9759f9bb7914ace1cb47a164e41407ab3300bc22cb1be4a5db2b54af77",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:61502dee35185376c2410ad1f6da7a638fa624f71fab5884e29aaceaf49c9eba"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-005e",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-13T04:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:167774ef6eb4fff8cdcec408d26f1d764f06e95ad252a617c4cba0385b4c0d73",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:7243d47ceb64c5c48aa1a59c5f6a35d9321a6ec17934f0b8b48bb0750c9c20ef"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-005f",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-14T05:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:a1b49bf707c0909c797b1538e5a15b79bcc0fd985d3f69ce52c4641b316a2a12",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:602533dc0a68013d679f2d9ec4445aaea01ac23acfd3bb743f7dc86b692a4f0e"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0060",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-15T06:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:31e7aed141cbcc3a0fdf7cc6eb8a25fccda7907710053d2c76cc057308ec379a",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:55c0a74d45b669f75cebe21356cd42d29b09ab55e6077d7910170d2bbf4e302c"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0061",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-16T07:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:b0882411b77570a4bf168da7431dbc3f0b286c709df24d5ef429c622f52b2549",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:98772790c1726f06b8b8f27000f72d3c4c22cab7468fb596ec9a360c5105122a"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0062",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-10T08:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:d375eff10635afef10b99ac9f178d77ff24d04fda24c8407ce3fa028ea9d18b2",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:c6bf4fa2f4337bd1773afe02f4ef6142b72fac4a79a5fd621b757b203bdea8c3"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0063",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-11T09:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:21f91a997e544d56d096bfd66e106c0ee9de047940449aa0ca30421862f2a21b",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:4da60990bd0d8cfeee59b397cd751e08023a80a22ed51b127f1d490eed97ec76"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0064",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-12T00:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:dc7a615d53eab0313c73d5f49b75036226bc9858c5d6d5e9b12e1de2d2a0169d",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:830ae19e143a51809880e88bc841721ec8a948145ca2c13275f5c1a051cdf2f9"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0065",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-13T01:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:a648a58c109257f76862bf793f4f8b9d28f1a81bc0bd1d8464457ea432830689",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:6d32a901faf20ac0292322d35364e64d8b6bfeae8d76d7a17b50079e08ab4ae4"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0066",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-14T02:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:3555d6ae15866ffb9fe5e39943cfeadf1279688cfce205cd1aefca62e22b64a6",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:2c564d56726c2c95f8dca309b5b39023fd09e37c7f9c13216bca9b3f18af266c"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0067",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-15T03:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:3c2496ebac9261f1e429c87c9ecc7b5f75ff199d6ab6114f2207c6c03bf449fd",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:c79dbc121f04a6ffc272f5a7aa17c57cc61c96dbd8d4250d89df5e79bf7b6c6c"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0068",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-16T04:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:4109d8d65f7b07b84485c04f911f52dc47868e4a4b354e934b3e90b7d7435571",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:3c49fdbd3ece9f2c2f8c6c083f5783ea707c5f3d32fe1f3642a55162bcf1fcb5"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0069",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-10T05:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:10970046538ae1c130312932940a3537e8566431e258d2684806d26f27401fa0",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:a64ed9963b3bc81386bc2b9981e004fb3ef68756fe111ebc406c61326564d134"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-006a",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-11T06:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:012664f61a327537097a5942fdaf451376c32dcda74068b219bd2640cef61d03",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:5fb65b55ea14843a72c39a28d72eb3a13b2a421ad1b0b70be200d218798a0d59"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-006b",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-12T07:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:99b9ede73087de350ce66f731e84fb363b9edacb4b2e7245e07b59d80a5527a2",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:833e469f5f4aebeb133ad73dee1fdde031b4932c954c2fc1d3f2e52df9143ef5"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-006c",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-13T08:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:aa2d6c38c71c588cc6664843428bf7739a60f91972f920262d819d38ddba8547",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:5985ea3f9eb4e92eb5af4c8a989d181ca33066bd1b1466f6019f7781f2198825"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-006d",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-14T09:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:fff7ba0d3437ccaa0b4e7f7c2430ca6d570b534d5e63af1609969e7c37b79c48",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:d0930b643414c2dce9f8f71fa6d21040bb7352c19973cf5c09c9d592414205c6"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-006e",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-15T00:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:9efac2922f65ab4e5f2ee40dada65cc468b3e3aa53c69b0ad19f0be902e9c9fb",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:7bc71df38c4caa837ee14b90cb978be3080e31b03412882213f388704fec0f40"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-006f",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-16T01:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:2790bb018cd5d187a9fda2ef65322a48cbbc6c9419f48c75687dd5121032888d",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:456b312cb2061ecc65d464fd29e78b06a72ed5081755c6de88b409c8a3a16d92"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0070",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-10T02:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:0d25f954f4042f1e6af7ea314ebe9880aaf5a86e48866d48fcfd36d168e7ed23",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:04a99e636a9c2a336a01260f5b7042dfe239d3d79107756fbece71454ff6f2c5"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0071",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-11T03:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:6406f458327bcda3a4fc86215d20c6a6cd5e4aa0ff2282e6c4440054dd3f4006",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:2814c437e6d143186f25630d018120f8f12616423423880b67ac56f8ba60491e"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0072",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-0",
+      "startedAt": "2026-09-12T04:20:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:5d5ec1ade201aafd93ea6a9467fde1c3172a390ad203acfe1d10e9316c7b31e2",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:247aabb58d323d9e0d3be8ee03cc2f9b21460c5a299c858dc5e6e62f75fdf37c"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0073",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-1",
+      "startedAt": "2026-09-13T05:21:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:ed5ec9049f48250d92a73f9d16cabe32658f62d1e8e84b0dce74b3c4a402bb72",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:296cb08c4886058b5912eb602558d6c02bf3977581247dd4bcbc58a35eef9b8b"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0074",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-2",
+      "startedAt": "2026-09-14T06:22:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:c0e908a87d920a56623c70ce1bd9d912112d4095eced8ded2bfa1f10856aab1d",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:d658c99a206c28564d36a8ed3284fc6fce017551f78530bfcaca003cce0843c2"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0075",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-3",
+      "startedAt": "2026-09-15T07:23:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:9b8e9a820da9f44a5084c63f7b949e54e9ad2bc7f9bd6bbb0b22a431f16d68f3",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:b02ef5f79ececbffb659f768e77b04751617643b634d1952a2e8fec0ed19557a"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0076",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-4",
+      "startedAt": "2026-09-16T08:24:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:9efd55d238d9e9abdb495244c92bdd5aa3ec4d322907db86e4219307d31615e5",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:90bfd7922ed6d460791397a3d445a53e3234752bd8aa7be39d5ee2f9678c4cb9"
+        }
+      ]
+    },
+    {
+      "name": "agent-router-7d9f4b-0077",
+      "namespace": "nasiko-agents",
+      "phase": "Running",
+      "restarts": 0,
+      "node": "pool-worker-5",
+      "startedAt": "2026-09-10T09:25:11Z",
+      "image": "registry.nasiko.dev/agents/router@sha256:5bf508a062320fa3280f005d84949aabf044c0326655b9f00aadacf037d7d190",
+      "containerStatuses": [
+        {
+          "name": "agent",
+          "ready": true,
+          "imageID": "sha256:314df386e5b5206ed0ce6bc4b991e961f87f4a4d3f3f407226437a8e1f80a4e8"
+        }
+      ]
+    }
+  ],
+  "conditions": [
+    {
+      "type": "Available",
+      "status": "True",
+      "lastTransitionTime": "2026-09-16T09:14:02Z"
+    },
+    {
+      "type": "Progressing",
+      "status": "False",
+      "reason": "ProgressDeadlineExceeded"
+    }
+  ],
+  "error": {
+    "pod": "agent-router-7d9f4b-0057",
+    "reason": "CrashLoopBackOff",
+    "message": "container 'agent' exited with code 137 (OOMKilled); limit 512Mi, peak 511Mi",
+    "lastState": {
+      "terminated": {
+        "exitCode": 137,
+        "signal": 9,
+        "finishedAt": "2026-09-16T11:02:44Z"
+      }
+    }
+  }
+}

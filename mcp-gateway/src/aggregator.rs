@@ -51,9 +51,17 @@ pub async fn aggregate_tools(
             }
         };
 
-        // Composio meta-tools pass through unchanged, unfiltered.
+        // Composio tools: filter out meta-tools (COMPOSIO_SEARCH_TOOLS,
+        // COMPOSIO_MULTI_EXECUTE_TOOL, COMPOSIO_MANAGE_CONNECTIONS, etc.)
+        // — agents now discover tools via the search index and call them by
+        // their real names; the gateway wraps in MULTI_EXECUTE transparently.
         if server.kind == ServerType::Composio {
-            merged.extend(tools);
+            merged.extend(tools.into_iter().filter(|t| {
+                t.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|n| !n.starts_with("COMPOSIO_"))
+                    .unwrap_or(true)
+            }));
             continue;
         }
 
@@ -209,6 +217,12 @@ mod tests {
                 toolcount_ttl_seconds: 3600,
                 oauth_state_signing_key: "test".to_string(),
                 description_model: "gpt-4o-mini".to_string(),
+                hitl_request_ttl_days: 7,
+                tool_search_mode: crate::config::ToolSearchMode::None,
+                tool_search_tool_limit: 15,
+                tool_search_meta_limit: 10,
+                openai_api_key: None,
+                embedding_model: "text-embedding-3-small".to_string(),
             },
             providers: Providers {
                 composio: None,
@@ -217,6 +231,7 @@ mod tests {
             authorizer: std::sync::Arc::new(crate::authorizer::OssConnectorAuthorizer),
             endpoint_refresher: std::sync::Arc::new(crate::endpoint_refresh::NoopEndpointRefresher),
             llm: nasiko_orchestrator::providers::LLMProvider::from_env(reqwest::Client::new()),
+            search_index: std::sync::Arc::new(crate::search::NoopSearchIndex),
         }
     }
 

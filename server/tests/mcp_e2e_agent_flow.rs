@@ -2,44 +2,29 @@
 //!
 //! ## What this proves vs. what already exists
 //!
-//! `mcp_delegation_auth.rs` proves the `require_delegation` auth gate in
-//! isolation (hand-minted token, `initialize` only). `mcp_connectors.rs` /
-//! `mcp_permissions_v2.rs` prove connector registration and permission CRUD.
-//! Nobody yet drives the FULL path in one test: register a real backend →
-//! grant an agent permission on some of its tools but not others → mint a
-//! delegation token exactly the way production code mints it → `tools/list`
-//! reflects the permission choices → `tools/call` on the allowed tool reaches
-//! the backend and returns its result → `tools/call` on the blocked tool is
-//! rejected *without the backend ever seeing it* (enforcement before the
-//! proxy hop, not after).
+//! `mcp_gateway_auth.rs` proves the gateway auth ladder in isolation
+//! (credential + flow-participant rules, docs/MCP_GATEWAY_AGENT_AUTH.md §2.4).
+//! `mcp_connectors.rs` / `mcp_permissions_v2.rs` prove connector registration
+//! and permission CRUD. Nobody yet drives the FULL path in one test: register
+//! a real backend → grant an agent permission on some of its tools but not
+//! others → authenticate exactly the way a deployed agent does (its
+//! deploy-time `MCP_GATEWAY_TOKEN` as a bearer + the traceparent of a live
+//! flow it participates in) → `tools/list` reflects the permission choices →
+//! `tools/call` on the allowed tool reaches the backend and returns its result
+//! → `tools/call` on the blocked tool is rejected *without the backend ever
+//! seeing it* (enforcement before the proxy hop, not after).
 //!
 //! ## Architecture note (read this before extending this file)
 //!
-//! There are two distinct producers of the `x-nasiko-agent-token` delegation
-//! header in this codebase:
-//!
-//!   1. `oss/server/src/agent_proxy.rs` mints one when the platform forwards a
-//!      request to an agent CONTAINER (`POST /api/agents/{id}/*`).
-//!   2. `oss/react-agent/src/tool.rs`'s `A2aTool` mints one when the
-//!      orchestrator's ReAct loop calls another AGENT over A2A.
-//!
-//! In BOTH cases the token lands on an agent container, which is expected to
-//! itself act as an MCP client and call `POST /api/mcp` directly: the agent
-//! reads the *inbound* `X-Nasiko-Agent-Token` header and forwards it here.
-//!
-//! `oss/react-agent/src/react_loop.rs` builds its tool set exclusively from
-//! `A2aTool` (`Orchestrator::build_tools` / `run_stream_inner`, both call
-//! `A2aTool::new(agent.clone(), ...)` for every entry in the agent registry —
-//! grep the file for any construction of an MCP-namespaced tool and there is
-//! none). There is no code path where the LLM inside the ReAct loop decides to
-//! call an MCP tool and the orchestrator process itself issues the
-//! `tools/call` HTTP request — `toolset.call(name, ...)` only ever dispatches
-//! to `call_agent_*` tools. So: **MCP tool-calling is not wired into the
-//! orchestrator's ReAct loop.** The only real, wired path today is exactly
-//! what this file exercises — an agent container (or anything else holding a
-//! valid delegation token) hitting `POST /api/mcp` directly over HTTP. That is
-//! the intended architecture (the Python helper module exists for precisely
-//! this), not a stand-in for a missing LLM auto-dispatch feature.
+//! An agent container is expected to act as an MCP client and call
+//! `POST /api/mcp` directly: it configures its client once at startup with
+//! `MCP_GATEWAY_URL` + `Authorization: Bearer $MCP_GATEWAY_TOKEN` (both
+//! injected at deploy time), and OTel propagation carries the `traceparent`
+//! of whichever flow it is currently serving. The orchestrator's ReAct loop
+//! builds its tool set exclusively from `A2aTool` — there is no code path
+//! where the orchestrator process itself issues a `tools/call` HTTP request.
+//! The only real, wired path is exactly what this file exercises — an agent
+//! container hitting `POST /api/mcp` directly over HTTP.
 //!
 //!   cargo test -p nasiko-server --test mcp_e2e_agent_flow -- --test-threads=1
 
@@ -48,7 +33,6 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use axum::{Json, Router, extract::State, routing::post};
-use nasiko_auth::jwt::mint_delegation_token;
 use nasiko_mcp_gateway::types::connector_prefix;
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -186,7 +170,8 @@ async fn agent_calls_mcp_gateway_end_to_end_with_permission_enforcement() {
     .unwrap();
     assert_eq!(res.status(), 201, "connector registration must succeed");
     let connector: Value = res.json().await.unwrap();
-    let connector_id = Uuid::parse_str(connector["connector_id"].as_str().unwrap()).unwrap();
+    let connector_id =
+        Uuid::parse_str(connector["data"]["connector_id"].as_str().unwrap()).unwrap();
     disallow_private_urls();
 
     // ── Grant the agent an explicit permission: block one tool, leave the other on default-allow ──
@@ -205,18 +190,18 @@ async fn agent_calls_mcp_gateway_end_to_end_with_permission_enforcement() {
     .unwrap();
     assert_eq!(res.status(), 200, "permission rule must be accepted");
 
-    // ── Mint the delegation token exactly the way production code does ──
-    // (same function, same argument order as `agent_proxy.rs`'s
-    // `mint_delegation_token(&jwt_secret, &claims.sub, &agent_id_str)` and
-    // `tool.rs`'s `mint_delegation_token(&d.jwt_secret, &d.user_id, &self.agent.id)`).
-    let token = mint_delegation_token(common::TEST_JWT_SECRET, &owner_id, &agent_id.to_string())
-        .expect("mint delegation token");
+    // ── Authenticate exactly the way a deployed agent does: its deploy-time
+    // gateway credential (bearer) + the traceparent of a live flow it was
+    // dispatched into (same records agent_proxy/a2a_dispatch write).
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+    let (_flow_id, traceparent) = common::open_flow(&server.db, owner_uuid, agent_id).await;
 
     let mcp = |body: Value| {
         server
             .client
             .post(server.url("/api/mcp"))
-            .header("x-nasiko-agent-token", &token)
+            .bearer_auth(&token)
+            .header("traceparent", &traceparent)
             .json(&body)
     };
 

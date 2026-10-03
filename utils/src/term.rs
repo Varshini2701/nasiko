@@ -1,5 +1,5 @@
 //! Live one-line terminal status animation, plus one-shot success/warning lines.
-//! Shared by `nasiko` (oss/cli) and `nasiko-ee` (ee/cli) so both CLIs get the
+//! Shared by `nasiko` (oss/cli) and `nasiko-ee` so both CLIs get the
 //! same look and feel.
 //!
 //! ```ignore
@@ -50,7 +50,11 @@ impl Drop for StatusHandle {
     }
 }
 
-fn use_color() -> bool {
+/// Whether ANSI color/SGR codes should be emitted, per the `NO_COLOR` convention
+/// (<https://no-color.org>). Shared so every caller that colors terminal output —
+/// this module's own status/box helpers and `nasiko chat`'s HITL prompts — honors
+/// the same env var consistently instead of each hardcoding its own check.
+pub fn use_color() -> bool {
     std::env::var_os("NO_COLOR").is_none()
 }
 
@@ -168,8 +172,202 @@ fn format_elapsed(duration: Duration) -> String {
     }
 }
 
+/// Visible width of `s`, skipping ANSI SGR (`\x1b[...m`) and OSC 8 hyperlink
+/// (`\x1b]8;;url\x1b\\...\x1b]8;;\x1b\\`) escape sequences — both appear in box content (colored
+/// labels, `nasiko chat`'s linkified replies) and would otherwise throw off [`print_box`]'s
+/// padding and word-wrap width, which must size by what's actually on screen, not byte length.
+/// Counts by `char`, not real display width, so CJK/fullwidth/emoji (which render 2 columns
+/// wide in most terminals) undercount and can throw off box alignment — not worth pulling in
+/// `unicode-width` for; known ceiling, not a bug to chase.
+pub fn visible_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            width += 1;
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                // OSC sequence: consume through its terminator, BEL or ST (`\x1b\\`).
+                while let Some(c2) = chars.next() {
+                    if c2 == '\x07' {
+                        break;
+                    }
+                    if c2 == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    width
+}
+
+/// Word-wraps `text` to `width` visible columns ([`visible_width`]), splitting on spaces and
+/// treating existing newlines as hard breaks. [`print_box`]'s only caller.
+fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0;
+        for word in paragraph.split(' ') {
+            let word_width = visible_width(word);
+            if !current.is_empty() && current_width + 1 + word_width > width {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            if !current.is_empty() {
+                current.push(' ');
+                current_width += 1;
+            }
+            current.push_str(word);
+            current_width += word_width;
+        }
+        lines.push(current);
+    }
+    lines
+}
+
+/// Draws a bordered box around `body` to stderr, with an optional `title` set into the top
+/// border — the visual anchor for anything that should stand out from the surrounding stream:
+/// `nasiko chat`'s sub-agent tool-call announcements/replies, and its HITL pause prompts.
+/// `color` is the ANSI SGR code (e.g. `"36"` cyan, `"33"` yellow) applied to the border and
+/// title; `body` may already carry its own ANSI colors or OSC 8 hyperlinks — sizing and
+/// wrapping account for that via [`visible_width`]. Width comes from the real terminal (same
+/// source [`start_status`] uses), clamped so a huge terminal doesn't produce an absurdly wide
+/// box and a narrow one still fits a full sentence. Respects `NO_COLOR` like the rest of this
+/// module.
+pub fn print_box(title: Option<&str>, body: &str, color: &str) {
+    let line_width = terminal_cols().clamp(40, 92).saturating_sub(2);
+    let content_width = line_width.saturating_sub(4).max(10);
+
+    let (open, close) = if use_color() {
+        (format!("\x1b[{color}m"), "\x1b[0m".to_string())
+    } else {
+        (String::new(), String::new())
+    };
+
+    let top = match title {
+        Some(t) => {
+            let dashes = line_width.saturating_sub(visible_width(t) + 5).max(1);
+            format!("┌─ {t} {}┐", "─".repeat(dashes))
+        }
+        None => format!("┌{}┐", "─".repeat(line_width.saturating_sub(2))),
+    };
+    eprintln!("{open}{top}{close}");
+
+    for raw_line in body.split('\n') {
+        for line in wrap_to_width(raw_line, content_width) {
+            let pad = content_width.saturating_sub(visible_width(&line));
+            eprintln!("{open}│{close} {line}{} {open}│{close}", " ".repeat(pad));
+        }
+    }
+    eprintln!(
+        "{open}└{}┘{close}",
+        "─".repeat(line_width.saturating_sub(2))
+    );
+}
+
+/// Reads one line of free-text input from a raw-mode terminal, with a full-redraw scheme
+/// (relative cursor movement, `prev_rows`-tracked, same technique as `nasiko`'s HITL combo-select
+/// widget) that stays correct once the buffer wraps past one physical terminal row — unlike
+/// `dialoguer::Input`, whose own incremental redraw desyncs at that point (confirmed live:
+/// typing a message long enough to wrap showed the prompt rendered twice, one frame truncated).
+/// `prompt` may carry ANSI color; `": "` is appended to match `dialoguer`'s own default
+/// formatting. Returns `Err` on Ctrl+C, Esc, or a non-interactive terminal — the same contract as
+/// `dialoguer::Input::interact_text()` — so callers written as `while let Ok(input) = ...` keep
+/// exiting their loop gracefully.
+pub fn read_text_line(prompt: &str) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use crossterm::cursor::{MoveToColumn, MoveUp};
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
+    use crossterm::execute;
+    use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
+    use std::io::stderr;
+
+    enable_raw_mode().context("this prompt needs an interactive terminal to answer")?;
+    struct RawGuard;
+    impl Drop for RawGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+    let _guard = RawGuard;
+
+    let mut buffer = String::new();
+    let mut out = stderr();
+    let mut prev_rows = 0usize;
+
+    loop {
+        let cols = terminal_cols();
+        // `prev_rows - 1` is how many rows to climb back to this line's first physical row
+        // (no trailing newline is printed, so the cursor sits on the *same* row as the last
+        // char written, unlike the combo-select widget's per-row-newline scheme). Only
+        // execute a `MoveUp` when that's actually positive: `MoveUp(0)` is not a no-op —
+        // ANSI's CUU defaults a 0 parameter to 1 (confirmed against both a real terminal and
+        // `pyte`), so emitting it here silently walked the cursor up one extra row per
+        // keystroke and clobbered whatever was already on screen above the prompt.
+        let rows_up = prev_rows.saturating_sub(1);
+        if rows_up > 0 {
+            execute!(
+                out,
+                MoveUp(rows_up.min(u16::MAX as usize) as u16),
+                MoveToColumn(0),
+                Clear(ClearType::FromCursorDown)
+            )?;
+        } else {
+            // `prev_rows` is 0 (first frame) or 1 (single row so far) — either way the cursor
+            // is already on the line's only row, so no vertical move is needed at all.
+            execute!(out, MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+        }
+
+        let line = format!("{prompt}: {buffer}");
+        write!(out, "{line}")?;
+        out.flush()?;
+        prev_rows = visible_width(&line).max(1).div_ceil(cols);
+
+        match read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    write!(out, "\r\n")?;
+                    out.flush()?;
+                    anyhow::bail!("cancelled");
+                }
+                KeyCode::Enter => {
+                    write!(out, "\r\n")?;
+                    out.flush()?;
+                    return Ok(buffer);
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                KeyCode::Esc => anyhow::bail!("cancelled"),
+                KeyCode::Char(c) => buffer.push(c),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
 /// Returns the terminal column count, falling back to `$COLUMNS`, then 80.
-fn terminal_cols() -> usize {
+pub fn terminal_cols() -> usize {
     crossterm::terminal::size()
         .ok()
         .map(|(w, _)| w as usize)
@@ -221,5 +419,40 @@ mod tests {
         let fitted = fit_msg(&long, 5);
         assert!(fitted.ends_with('…'));
         assert!(fitted.chars().count() < 500);
+    }
+
+    #[test]
+    fn visible_width_ignores_sgr_codes() {
+        assert_eq!(visible_width("\x1b[1;36mhello\x1b[0m"), 5);
+    }
+
+    #[test]
+    fn visible_width_ignores_osc8_hyperlinks() {
+        let hyperlink = "\x1b]8;;https://example.com\x1b\\\x1b[34;4mhere\x1b[0m\x1b]8;;\x1b\\";
+        assert_eq!(visible_width(hyperlink), 4);
+    }
+
+    #[test]
+    fn visible_width_plain_text_is_char_count() {
+        assert_eq!(visible_width("plain text"), 10);
+    }
+
+    #[test]
+    fn wrap_to_width_breaks_on_spaces_within_budget() {
+        let wrapped = wrap_to_width("one two three four", 8);
+        assert_eq!(wrapped, vec!["one two", "three", "four"]);
+    }
+
+    #[test]
+    fn wrap_to_width_preserves_existing_newlines_as_hard_breaks() {
+        let wrapped = wrap_to_width("first line\nsecond line", 80);
+        assert_eq!(wrapped, vec!["first line", "second line"]);
+    }
+
+    #[test]
+    fn wrap_to_width_never_splits_a_single_long_word() {
+        let word = "x".repeat(20);
+        let wrapped = wrap_to_width(&word, 8);
+        assert_eq!(wrapped, vec![word]);
     }
 }

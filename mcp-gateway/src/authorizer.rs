@@ -107,18 +107,20 @@ impl ConnectorAuthorizer for OssConnectorAuthorizer {
             .collect();
         candidate_ids.sort();
         candidate_ids.dedup();
-        let labels = repo::resolve_user_labels(db, &candidate_ids).await?;
+        let labels = repo::resolve_user_details(db, &candidate_ids).await?;
 
         let mut reasons: HashMap<Uuid, AccessReason> = HashMap::new();
         if let Some(owner_id) = connector.owner_id
-            && let Some((username, display_name)) = labels.get(&owner_id)
+            && let Some(u) = labels.get(&owner_id)
         {
             reasons.insert(
                 owner_id,
                 AccessReason {
                     user_id: owner_id,
-                    username: username.clone(),
-                    display_name: display_name.clone(),
+                    username: u.username.clone(),
+                    display_name: u.display_name.clone(),
+                    email: u.email.clone(),
+                    role: u.role.clone(),
                     via: "owner".into(),
                     via_label: None,
                 },
@@ -128,13 +130,15 @@ impl ConnectorAuthorizer for OssConnectorAuthorizer {
             if reasons.contains_key(&id) {
                 continue;
             }
-            if let Some((username, display_name)) = labels.get(&id) {
+            if let Some(u) = labels.get(&id) {
                 reasons.insert(
                     id,
                     AccessReason {
                         user_id: id,
-                        username: username.clone(),
-                        display_name: display_name.clone(),
+                        username: u.username.clone(),
+                        display_name: u.display_name.clone(),
+                        email: u.email.clone(),
+                        role: u.role.clone(),
                         via: "direct".into(),
                         via_label: None,
                     },

@@ -23,6 +23,17 @@ axum = { version = "0.8", features = ["json", "query", "multipart"] }
 walkdir = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Full span export (matches every sibling agent, e.g. oss/agents/hr-agent) — the LLM
+# gateway needs real gen_ai.* spans to record token/cost usage, not just the
+# traceparent propagation this crate used to carry alone. See src/telemetry.rs.
+opentelemetry = { version = "0.28", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry-semantic-conventions = "0.28"
+tracing-opentelemetry = "0.29"
+# Vendored copy, not a `../` sibling path — see vendor/coding-policy/Cargo.toml
+# and oss/coding-policy/sync-vendor.sh for why.
+nasiko-coding-policy = { path = "vendor/coding-policy" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

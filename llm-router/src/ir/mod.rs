@@ -5,7 +5,7 @@ pub mod chat;
 pub mod embeddings;
 
 pub use chat::{
-    ChatChunk, ChatRequest, ChatResponse, Choice, ChunkChoice, Delta, FunctionCall,
-    FunctionCallDelta, FunctionDef, Message, ToolCall, ToolCallDelta, ToolDef, Usage,
+    CacheCreationUsage, ChatChunk, ChatRequest, ChatResponse, Choice, ChunkChoice, Delta,
+    FunctionCall, FunctionCallDelta, FunctionDef, Message, ToolCall, ToolCallDelta, ToolDef, Usage,
 };
 pub use embeddings::{Embedding, EmbeddingsRequest, EmbeddingsResponse};

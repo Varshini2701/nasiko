@@ -10,3 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+# So a dropped/malformed selectable-options block (`a2a::hoist_structured_options`) is observable
+# rather than a silent fallback — every other crate in the workspace already depends on this same
+# pinned version, declared once at the root.
+tracing = { workspace = true }

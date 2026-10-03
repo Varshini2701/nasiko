@@ -360,6 +360,7 @@ mod tests {
                 session: CodingAgentSession {
                     id: "claude:session".into(),
                     source_id: "session".into(),
+                    title: None,
                 },
                 turn: CodingAgentTurn {
                     id: "turn".into(),

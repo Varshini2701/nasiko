@@ -7,6 +7,32 @@
 
 use nasiko_config::Config;
 
+/// Tool search mode — selects the `ToolSearchIndex` implementation wired at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolSearchMode {
+    /// Flat embedding-based cosine similarity (default). Falls back to `Keyword`
+    /// at startup when `EMBEDDING_MODEL` is not set.
+    Semantic,
+    /// Flat BM25 keyword search — no external dependencies.
+    Keyword,
+    /// Disabled: eager fan-out, return all tools (rollback path).
+    None,
+}
+
+impl ToolSearchMode {
+    pub fn parse(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "semantic" => Self::Semantic,
+            "keyword" => Self::Keyword,
+            "none" => Self::None,
+            _ => {
+                tracing::warn!(value = %s, "unknown MCP_TOOL_SEARCH_MODE, defaulting to semantic");
+                Self::Semantic
+            }
+        }
+    }
+}
+
 /// Runtime settings for the MCP gateway, copied out of the central `Config`.
 #[derive(Debug, Clone)]
 pub struct McpConfig {
@@ -43,6 +69,24 @@ pub struct McpConfig {
     pub oauth_state_signing_key: String,
     /// Model for the description-backfill LLM fallback (`description_backfill.rs`).
     pub description_model: String,
+    /// How long a pending `mcp_tool`-origin `hitl_requests` row (an `auth_required`/
+    /// `tool_approval` pause this gateway creates) stays answerable before the dispatcher expires
+    /// it — `Config::hitl_request_ttl_days` (env: `HITL_REQUEST_TTL_DAYS`), the same knob every
+    /// other `HitlKind` already honors via `PgHitlStore::with_ttl_days`. Passed to
+    /// `nasiko_hitl::repo::create_pending_auth_required_with_ttl`/
+    /// `create_pending_tool_approval_with_ttl` rather than their fixed-7-day counterparts (found
+    /// in review: setting the env var used to have no effect on anything this gateway created).
+    pub hitl_request_ttl_days: i64,
+    /// Tool search mode — selects the search index implementation.
+    pub tool_search_mode: ToolSearchMode,
+    /// Max tools returned by query-aware `tools/list`.
+    pub tool_search_tool_limit: usize,
+    /// Max tools returned by `nasiko_search_tools` meta-tool.
+    pub tool_search_meta_limit: usize,
+    /// OpenAI API key for embedding queries (semantic mode).
+    pub openai_api_key: Option<String>,
+    /// Embedding model name (e.g. `text-embedding-3-small`).
+    pub embedding_model: String,
 }
 
 impl McpConfig {
@@ -77,6 +121,12 @@ impl McpConfig {
                     "OAUTH_STATE_SIGNING_KEY or JWT_SECRET must be set for MCP OAuth state signing",
                 ),
             description_model: config.mcp_description_model.clone(),
+            hitl_request_ttl_days: config.hitl_request_ttl_days,
+            tool_search_mode: ToolSearchMode::parse(&config.mcp_tool_search_mode),
+            tool_search_tool_limit: config.mcp_tool_search_tool_limit,
+            tool_search_meta_limit: config.mcp_tool_search_meta_limit,
+            openai_api_key: config.openai_api_key.clone(),
+            embedding_model: config.embedding_model.clone(),
         }
     }
 
@@ -123,6 +173,12 @@ mod tests {
             toolcount_ttl_seconds: 3600,
             oauth_state_signing_key: "test".to_string(),
             description_model: "gpt-4o-mini".to_string(),
+            hitl_request_ttl_days: 7,
+            tool_search_mode: ToolSearchMode::None,
+            tool_search_tool_limit: 15,
+            tool_search_meta_limit: 10,
+            openai_api_key: None,
+            embedding_model: "text-embedding-3-small".to_string(),
         }
     }
 

@@ -21,6 +21,10 @@ pub struct AgentSkill {
     pub name: String,
     pub description: String,
     pub tags: Vec<String>,
+    /// The AgentCard's own `examples` — the literal inputs this skill expects, carried into the
+    /// planner's preamble. Defaulted: a registry entry that predates them is still valid.
+    #[serde(default)]
+    pub examples: Vec<String>,
 }
 
 /// Where agents are discovered from.

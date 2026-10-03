@@ -151,3 +151,13 @@ pub fn remote_context_from_traceparent(tp: &str) -> Option<opentelemetry::Contex
     use opentelemetry::trace::TraceContextExt;
     ctx.span().span_context().is_valid().then_some(ctx)
 }
+
+/// Inject the given OTel context as a W3C `traceparent` header value for an outbound
+/// HTTP call, so the LLM gateway can attribute the call to the originating user flow.
+/// Returns None when the context carries no valid span context.
+pub fn traceparent_for_context(cx: &opentelemetry::Context) -> Option<String> {
+    use opentelemetry::propagation::TextMapPropagator;
+    let mut carrier = std::collections::HashMap::new();
+    opentelemetry_sdk::propagation::TraceContextPropagator::new().inject_context(cx, &mut carrier);
+    carrier.get("traceparent").cloned()
+}

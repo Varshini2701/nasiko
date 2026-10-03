@@ -292,6 +292,79 @@ async fn insert_running_agent(db: &PgPool, name: &str) -> Uuid {
     .expect("insert running agent")
 }
 
+/// Insert a running agent with `is_internal = true` — must never be a routing candidate.
+async fn insert_internal_agent(db: &PgPool, name: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO agents (name, description, status, owner_id, url, skills, is_internal)
+         VALUES ($1, 'Internal test agent', 'running', $2,
+                 'http://orchestrator-test-nonexistent.local:8080', '[]'::jsonb, true)
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(Uuid::parse_str(SUPERUSER_ID).unwrap())
+    .fetch_one(db)
+    .await
+    .expect("insert internal agent")
+}
+
+/// An `is_internal` agent is the ONLY running agent — the routing engine
+/// must still report NoAgentsAvailable (503), proving the exclusion actually
+/// removes it from the candidate pool rather than just hiding it from a list.
+#[tokio::test]
+#[serial]
+async fn test_routing_excludes_internal_tagged_agent() {
+    let server = common::TestServer::start().await;
+    insert_test_user(&server.db).await;
+    insert_internal_agent(&server.db, "internal-only-agent").await;
+
+    let resp = as_superuser(
+        server
+            .client
+            .post(server.url("/api/orchestrator/a2a"))
+            .json(&stream_body("what can you help me with?")),
+    )
+    .send()
+    .await
+    .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        503,
+        "an is_internal agent must never be a routing candidate, even as the only one"
+    );
+
+    server.cleanup().await;
+}
+
+/// With one normal agent AND one `is_internal` agent, routing must select
+/// the normal one — proving the exclusion doesn't disturb ordinary candidates.
+#[tokio::test]
+#[serial]
+async fn test_routing_selects_normal_agent_alongside_an_internal_one() {
+    let server = common::TestServer::start().await;
+    insert_test_user(&server.db).await;
+    insert_running_agent(&server.db, "normal-alongside-internal").await;
+    insert_internal_agent(&server.db, "internal-alongside-normal").await;
+
+    let resp = as_superuser(
+        server
+            .client
+            .post(server.url("/api/orchestrator/a2a"))
+            .json(&stream_body("what can you help me with?")),
+    )
+    .send()
+    .await
+    .unwrap();
+
+    assert_ne!(
+        resp.status(),
+        503,
+        "the normal agent must still be selected even with an internal one also present"
+    );
+
+    server.cleanup().await;
+}
+
 /// With 1 running agent the routing engine selects it (Stage 1 skips Ollama —
 /// count=1 < shortlist_threshold=15). The agent URL is unreachable so the call
 /// fails with 500 Internal (not 503 NoAgentsAvailable), proving routing ran.

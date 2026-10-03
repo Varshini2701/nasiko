@@ -50,6 +50,7 @@ fn agent_card_summary_constructs_with_all_fields() {
         skills: vec![SkillSummary {
             name: "rust".to_string(),
             description: "Rust programming".to_string(),
+            examples: Vec::new(),
         }],
         tags: vec!["engineering".to_string()],
     };
@@ -66,6 +67,7 @@ fn agent_card_summary_round_trips_through_json() {
         skills: vec![SkillSummary {
             name: "s1".to_string(),
             description: "d1".to_string(),
+            examples: Vec::new(),
         }],
         tags: vec!["t1".to_string()],
     };
@@ -89,6 +91,7 @@ fn skill_summary_constructs() {
     let s = SkillSummary {
         name: "code-review".to_string(),
         description: "Reviews code for bugs".to_string(),
+        examples: Vec::new(),
     };
     assert_eq!(s.name, "code-review");
     assert_eq!(s.description, "Reviews code for bugs");
@@ -99,6 +102,7 @@ fn skill_summary_round_trips_through_json() {
     let original = SkillSummary {
         name: "summarize".to_string(),
         description: "Summarizes long documents".to_string(),
+        examples: Vec::new(),
     };
     let json = serde_json::to_string(&original).unwrap();
     let restored: SkillSummary = serde_json::from_str(&json).unwrap();
@@ -111,11 +115,73 @@ fn skill_summary_round_trips_through_json() {
 #[tokio::test]
 async fn select_agent_with_empty_list_returns_error() {
     let selector = make_selector();
-    let result = selector.select_agent("some query", &[], &[]).await;
+    let result = selector.select_agent("some query", &[], &[], None).await;
     assert!(
         result.is_err(),
         "select_agent should return Err when no agents provided"
     );
+}
+
+// ── select_agent: hallucinated agent_id ────────────────────────────────────────
+// Regression for a mislabeled fallback: when the model names an agent_id that
+// doesn't exist in the candidate list, select_agent substitutes the first real
+// candidate but was returning `fallback_used = false` for it — indistinguishable
+// in router_logs from a genuine, confident, non-fallback pick. The returned
+// `bool` must be `true` for this path.
+
+#[tokio::test]
+async fn select_agent_flags_hallucinated_id_as_fallback_used() {
+    let mut server = mockito::Server::new_async().await;
+    let ghost_id = Uuid::new_v4();
+    let real_agent = dummy_agent("real-agent", "Does real things", vec![]);
+
+    let selection_json = serde_json::json!({
+        "agent_id": ghost_id,
+        "agent_name": "ghost-agent",
+        "reasoning": "looks like a great fit",
+        "confidence": 90,
+    })
+    .to_string();
+
+    let body = serde_json::json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": selection_json },
+            "finish_reason": "stop",
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 },
+    })
+    .to_string();
+
+    server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(body)
+        .create_async()
+        .await;
+
+    let provider = LLMProvider::new(reqwest::Client::new(), "sk-test".to_string(), server.url());
+    let selector = AgentSelector::new(provider, "test-model".to_string());
+
+    let (selection, _usage, hallucinated_fallback) = selector
+        .select_agent("do the thing", &[], std::slice::from_ref(&real_agent), None)
+        .await
+        .expect("a hallucinated agent_id should resolve via fallback, not error");
+
+    assert!(
+        hallucinated_fallback,
+        "a hallucinated agent_id must be flagged as a fallback"
+    );
+    assert_eq!(
+        selection.agent_id, real_agent.id,
+        "should substitute the first real candidate"
+    );
+    assert_ne!(selection.agent_id, ghost_id);
 }
 
 // ── select_agent: live LLM tests ──────────────────────────────────────────────
@@ -138,6 +204,7 @@ async fn select_agent_with_live_llm_returns_valid_selection() {
             skills: vec![SkillSummary {
                 name: "rust".to_string(),
                 description: "Rust programming".to_string(),
+                examples: Vec::new(),
             }],
             tags: vec!["engineering".to_string()],
         },
@@ -148,16 +215,17 @@ async fn select_agent_with_live_llm_returns_valid_selection() {
             skills: vec![SkillSummary {
                 name: "trading".to_string(),
                 description: "Financial analysis".to_string(),
+                examples: Vec::new(),
             }],
             tags: vec!["finance".to_string()],
         },
     ];
 
     let result = selector
-        .select_agent("write a Rust function", &[], &agents)
+        .select_agent("write a Rust function", &[], &agents, None)
         .await;
     assert!(result.is_ok(), "expected Ok, got {result:?}");
-    let (selection, _usage) = result.unwrap();
+    let (selection, _usage, _hallucinated_fallback) = result.unwrap();
     assert!(!selection.reasoning.is_empty());
 }
 

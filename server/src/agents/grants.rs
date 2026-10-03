@@ -49,6 +49,7 @@ pub fn router() -> Router<AppState> {
 /// (`can_manage_agent`), never on mere view access: otherwise a public agent's
 /// viewer or an invoke-grantee could enumerate or rewrite its grants, or transfer
 /// its ownership (RUN-9 / AUTH-1).
+#[allow(clippy::result_large_err)]
 async fn check_access(
     state: &AppState,
     claims: &Claims,

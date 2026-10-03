@@ -193,7 +193,7 @@ pub async fn put_manifest(
     for blob_digest in &blob_digests {
         crate::ops::blobs::claim_blob(
             &mut tx,
-            &state.storage,
+            state.storage.as_ref(),
             repository,
             blob_digest,
             OciCode::ManifestBlobUnknown,

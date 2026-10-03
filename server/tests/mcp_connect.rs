@@ -412,6 +412,108 @@ async fn composio_callback_off_origin_success_url_is_neutralized_vuln3() {
     server.cleanup().await;
 }
 
+/// Companion to `mcp_oauth.rs`'s
+/// `callback_auto_resolves_pending_auth_required_hitl_row` — that test covers
+/// the generic OAuth2 connector callback (`oauth.rs::handle_callback`); this
+/// one covers Composio's separate callback (`connect.rs::handle_composio_callback`).
+/// Found live: a manual end-to-end run through a real Composio-hosted GitHub
+/// authorization confirmed the connection went ACTIVE but the pending
+/// `auth_required` row stayed `pending` forever — the original auto-resolve
+/// fix only touched the generic path, never this one. Same fix, same shape,
+/// applied here too.
+#[tokio::test]
+#[serial]
+async fn composio_callback_auto_resolves_pending_auth_required_hitl_row() {
+    let mut mock_server = mockito::Server::new_async().await;
+    let _m = mock_server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex("/api/v3/connected_accounts.*".into()),
+        )
+        .with_status(200)
+        .with_body(
+            r#"{"items":[{"id":"ca_e2e","status":"ACTIVE","auth_config":{"id":"ac_e2e_toolkit"}}]}"#,
+        )
+        .create_async()
+        .await;
+    set_composio_provider(&mock_server.url());
+
+    let server = common::TestServer::start().await;
+    let (uid, uuid) = init_admin(&server).await;
+    let cid = seed_composio_connector(&server, "e2e-toolkit", "ac_e2e_toolkit").await;
+    seed_pending_connection(&server, uuid, cid, "INITIATED").await;
+
+    let agent_id: Uuid =
+        sqlx::query_scalar("INSERT INTO agents (name, owner_id) VALUES ($1, $2) RETURNING id")
+            .bind("composio-auto-resolve-agent")
+            .bind(uuid)
+            .fetch_one(&server.db)
+            .await
+            .unwrap();
+
+    let pending = nasiko_hitl::repo::create_pending_auth_required(
+        &server.db,
+        nasiko_hitl::NewAuthRequired {
+            agent_id,
+            owner_user_id: uuid,
+            connector_id: cid,
+            context_id: "ses_composio_auto_resolve_test".to_string(),
+            question: json!({"message": "Tool requires re-authentication.", "connector": "e2e-toolkit"}),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(pending.status, nasiko_hitl::HitlStatus::Pending);
+
+    let res = no_redirect_client()
+        .get(server.url("/oauth/callback"))
+        .query(&[
+            ("user_id", uid.as_str()),
+            ("connector_id", &cid.to_string()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "the callback itself must still succeed");
+    let body = res.text().await.unwrap();
+    assert!(body.contains("Connected successfully"), "{body}");
+
+    let (status, human_response): (String, Option<Value>) =
+        sqlx::query_as("SELECT status, human_response FROM hitl_requests WHERE id = $1")
+            .bind(pending.id)
+            .fetch_one(&server.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "resolved",
+        "the pending auth_required row must auto-resolve once the composio callback confirms ACTIVE"
+    );
+    assert_eq!(
+        human_response.as_ref().and_then(|v| v["decision"].as_str()),
+        Some("approve")
+    );
+
+    let mut resume_status = "not_started".to_string();
+    for _ in 0..20 {
+        resume_status = sqlx::query_scalar("SELECT resume_status FROM hitl_requests WHERE id = $1")
+            .bind(pending.id)
+            .fetch_one(&server.db)
+            .await
+            .unwrap();
+        if resume_status != "not_started" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_ne!(
+        resume_status, "not_started",
+        "the mcp_tool dispatcher must claim the now-resolved row within its poll interval"
+    );
+
+    clear_composio_provider();
+    server.cleanup().await;
+}
+
 #[tokio::test]
 #[serial]
 async fn composio_callback_missing_params_is_message_not_redirect() {

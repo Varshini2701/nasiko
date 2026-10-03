@@ -38,6 +38,28 @@ async fn embeddings_core(
     let authz = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
     let (agent_id, owner_id) = verify_agent_jwt(authz, &ctx.cfg)?;
 
+    // Strict flow attribution — same rule as chat (previously embeddings
+    // attempted none at all): the traceparent must name a live flow this agent
+    // participates in, or the call is refused. Accepted consequence: an agent
+    // cannot embed outside a user flow (startup/ingest-time indexing is not
+    // currently supported) — see oss/docs/TOKEN_ATTRIBUTION.md.
+    let raw_traceparent = headers
+        .get(TRACEPARENT_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let attribution = crate::routing::attribution::resolve(
+        store,
+        &agent_id,
+        raw_traceparent.and_then(parse_flow_id),
+        ctx.cfg.attribution_window_secs as i64,
+    )
+    .await
+    .map_err(|denied| {
+        GatewayError::Forbidden(format!(
+            "{denied} (received traceparent: {})",
+            raw_traceparent.unwrap_or("<none>")
+        ))
+    })?;
+
     // Embeddings speak the OpenAI surface only. A configured agent ignores the request
     // model; a no-llm_config agent is routed to what it asked for (openai + request model),
     // with the platform default as the last-resort safety net.
@@ -57,20 +79,33 @@ async fn embeddings_core(
 
     usage::spawn_log(
         ctx.db.clone(),
+        ctx.pricing.clone(),
         UsageRecord {
-            owner_id,
+            // Billed to the flow's caller (strict attribution guarantees a
+            // flow); the JWT's owner is only the no-user safety net.
+            owner_id: attribution
+                .user_id
+                .map(|u| u.to_string())
+                .unwrap_or(owner_id),
             agent_id,
             operation_type: "embedding",
             provider,
             model,
             usage: resp.usage.clone(),
+            cached_tokens: None,
+            reasoning_tokens: None,
             latency_ms,
             streaming: false,
             finish_reason: None,
-            flow_id: headers
-                .get(TRACEPARENT_HEADER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(parse_flow_id),
+            flow_id: Some(attribution.flow_id.clone()),
+            attribution_source: Some(attribution.source),
+            // Never compressed: this surface does not go through `chat_core`.
+            compress_metadata: None,
+            // Embeddings are not chat completions; IP-2 never runs here.
+            brevity_metadata: None,
+            // Nothing was compressed, so there is nothing to credit to a savings layer.
+            compress_bytes: None,
+            request_bytes: None,
             platform_paid: resolved.platform_paid,
         },
     );
@@ -108,9 +143,29 @@ mod tests {
                 config: None,
                 agent_pinned_model: None,
                 is_coding_agent: false,
+                compress_enabled: false,
             }))
         }
         async fn fetch_user_secret(&self, _: Uuid, _: &str) -> Result<Option<String>, sqlx::Error> {
+            Ok(None)
+        }
+        async fn fetch_live_flow(
+            &self,
+            _: &str,
+            _: Uuid,
+            _: i64,
+        ) -> Result<Option<crate::routing::attribution::LiveFlow>, sqlx::Error> {
+            Ok(Some(crate::routing::attribution::LiveFlow {
+                user_id: None,
+                context_id: None,
+                mode: None,
+                agent_is_participant: true,
+            }))
+        }
+        async fn fetch_custom_provider(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::resolver::CustomProvider>, sqlx::Error> {
             Ok(None)
         }
     }
@@ -130,15 +185,43 @@ mod tests {
             cfg: Arc::new(cfg),
             cache: Arc::new(ConfigCache::new(Duration::from_secs(30))),
             router_cache: Arc::new(crate::routing::NoopCache),
-            tier_registry: Arc::new(crate::routing::StaticTierRegistry),
+            tier_registry: Arc::new(crate::routing::registry::test_support::StubRegistry),
             cell_store: Arc::new(crate::routing::InMemoryCellStore::new()),
+            salience_gate: Arc::new(crate::routing::AllowAllGate),
+            request_classifier: Arc::new(crate::routing::RegexClassifier),
+            pricing: Arc::new(nasiko_pricing::PricingEngine::new(
+                PgPool::connect_lazy("postgres://u:p@127.0.0.1:5999/none").unwrap(),
+            )),
         }
     }
 
     fn auth_headers(token: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        // Strict attribution: embeddings must carry trace context too.
+        h.insert(
+            TRACEPARENT_HEADER,
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                .parse()
+                .unwrap(),
+        );
         h
+    }
+
+    #[tokio::test]
+    async fn missing_traceparent_is_403() {
+        // Embeddings previously attempted no attribution at all — under strict
+        // enforcement they are refused without a resolvable flow.
+        let ctx = ctx_with("http://unused".into());
+        let token =
+            crate::auth::mint_agent_token(AGENT, OWNER, SECRET, 3600, Algorithm::HS256).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        let body = json!({ "model": "text-embedding-3-large", "input": "hello" });
+        let err = embeddings_core(&ctx, &Store, &headers, body)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GatewayError::Forbidden(_)));
     }
 
     async fn body_json(resp: Response) -> Value {

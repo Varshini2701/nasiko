@@ -13,15 +13,20 @@ uuid = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 
+# `bytes` is unconditional: the `BlobStore` trait's payloads are `Bytes`, and
+# the trait must exist for every feature combination (the k8s runtime builds
+# this crate without `docker`). `futures-util` is likewise unconditional now
+# that `WorkspaceFile` puts a byte stream in the public API.
+bytes = { workspace = true }
+futures-util = { version = "0.3" }
+
 # docker feature
 bollard = { version = "0.17", optional = true }
-bytes = { workspace = true, optional = true }
-futures-util = { version = "0.3", optional = true }
 serde_json = { workspace = true, optional = true }
 
 [features]
 default = ["docker"]
-docker = ["dep:bollard", "dep:bytes", "dep:futures-util", "dep:serde_json"]
+docker = ["dep:bollard", "dep:serde_json"]
 simulated = []
 
 [dev-dependencies]

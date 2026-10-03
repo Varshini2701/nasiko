@@ -69,6 +69,10 @@ struct SkillRow {
     name: String,
     description: String,
     tags: Vec<String>,
+    /// The AgentCard's own `examples` — the literal inputs this skill expects. A planner that
+    /// only ever sees a paraphrasable name and description has to invent the wording it sends,
+    /// which loses any skill that recognises an exact phrase.
+    examples: Value,
 }
 
 /// Every running agent, with its callable endpoint and advertised skills.
@@ -81,13 +85,15 @@ struct SkillRow {
 async fn discoverable_agents(state: &AppState) -> Result<Vec<Value>, sqlx::Error> {
     let rows = sqlx::query_as::<_, AgentRow>(
         "SELECT id, name, description, url FROM agents \
-         WHERE status = 'running' AND deleted_at IS NULL ORDER BY name",
+         WHERE status = 'running' AND deleted_at IS NULL \
+           AND NOT is_internal \
+         ORDER BY name",
     )
     .fetch_all(&state.db)
     .await?;
 
     let skills = sqlx::query_as::<_, SkillRow>(
-        "SELECT agent_id, skill_key, name, description, tags FROM agent_skills",
+        "SELECT agent_id, skill_key, name, description, tags, examples FROM agent_skills",
     )
     .fetch_all(&state.db)
     .await?;
@@ -111,6 +117,7 @@ async fn discoverable_agents(state: &AppState) -> Result<Vec<Value>, sqlx::Error
                     "name": s.name,
                     "description": s.description,
                     "tags": s.tags,
+                    "examples": s.examples,
                 })
             })
             .collect();

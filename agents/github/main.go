@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -21,14 +20,20 @@ import (
 	// [nasiko:imports]
 )
 
-type githubExecutor struct{}
+type githubExecutor struct {
+	llm *llmClient
+}
 
 var _ a2asrv.AgentExecutor = (*githubExecutor)(nil)
 
-func (*githubExecutor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
+func (g *githubExecutor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
+	// The inbound W3C trace context, forwarded on the LLM call for attribution.
+	traceparent := firstParam(execCtx, "traceparent")
 	return func(yield func(a2a.Event, error) bool) {
 		userText := extractText(execCtx.Message)
-		result, err := handleQuery(ctx, userText)
+		// Run the LLM tool-calling loop: the model picks the GitHub tools, we
+		// execute them, then the model synthesizes the answer.
+		result, err := g.llm.runAgentLoop(ctx, userText, traceparent)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -37,35 +42,21 @@ func (*githubExecutor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorCont
 	}
 }
 
-func (*githubExecutor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
-	return func(yield func(a2a.Event, error) bool) {}
+// firstParam reads a single-valued service param (the a2a-go handler copies the
+// inbound HTTP headers into ExecutorContext.ServiceParams, lowercased).
+func firstParam(execCtx *a2asrv.ExecutorContext, name string) string {
+	if execCtx == nil || execCtx.ServiceParams == nil {
+		return ""
+	}
+	vals, ok := execCtx.ServiceParams.Get(name)
+	if !ok || len(vals) == 0 {
+		return ""
+	}
+	return vals[0]
 }
 
-// repoRef matches an owner/repo token, optionally followed by a /path inside the repo.
-var repoRef = regexp.MustCompile(`\b([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/([A-Za-z0-9_.-]+)((?:/[A-Za-z0-9_.\- ]+)*)`)
-
-func handleQuery(ctx context.Context, query string) (string, error) {
-	query = strings.TrimSpace(query)
-	if query == "" {
-		return usage(), nil
-	}
-	lower := strings.ToLower(query)
-
-	m := repoRef.FindStringSubmatch(query)
-	wantsReadme := strings.Contains(lower, "readme")
-	wantsFiles := containsAny(lower, "ls ", "list ", "files", "contents", "browse", "tree", "navigate", "structure", "what's in", "whats in")
-
-	switch {
-	case m != nil && wantsReadme:
-		return getReadme(ctx, m[1], m[2])
-	case m != nil && (wantsFiles || m[3] != ""):
-		path := strings.Trim(m[3], "/ ")
-		return listContents(ctx, m[1], m[2], path)
-	case m != nil && !containsAny(lower, "search", "find "):
-		return repoInfo(ctx, m[1], m[2])
-	default:
-		return searchRepos(ctx, cleanSearchQuery(query))
-	}
+func (*githubExecutor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
+	return func(yield func(a2a.Event, error) bool) {}
 }
 
 func searchRepos(ctx context.Context, query string) (string, error) {
@@ -103,13 +94,15 @@ func searchRepos(ctx context.Context, query string) (string, error) {
 func repoInfo(ctx context.Context, owner, repo string) (string, error) {
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s", owner, repo)
 	var data struct {
-		FullName      string   `json:"full_name"`
-		Description   string   `json:"description"`
-		Stars         int      `json:"stargazers_count"`
-		Forks         int      `json:"forks_count"`
-		OpenIssues    int      `json:"open_issues_count"`
-		Language      string   `json:"language"`
-		License       *struct{ Name string `json:"name"` } `json:"license"`
+		FullName    string `json:"full_name"`
+		Description string `json:"description"`
+		Stars       int    `json:"stargazers_count"`
+		Forks       int    `json:"forks_count"`
+		OpenIssues  int    `json:"open_issues_count"`
+		Language    string `json:"language"`
+		License     *struct {
+			Name string `json:"name"`
+		} `json:"license"`
 		DefaultBranch string   `json:"default_branch"`
 		Topics        []string `json:"topics"`
 		HTMLURL       string   `json:"html_url"`
@@ -233,29 +226,6 @@ func rateLimitReset(resp *http.Response) string {
 	return time.Unix(epoch, 0).UTC().Format("15:04 UTC")
 }
 
-func cleanSearchQuery(q string) string {
-	lower := strings.ToLower(q)
-	for _, prefix := range []string{
-		"search for ", "search ", "find repos for ", "find repositories for ",
-		"find ", "look for ", "repos for ", "repositories for ",
-	} {
-		if strings.HasPrefix(lower, prefix) {
-			q = q[len(prefix):]
-			break
-		}
-	}
-	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(q), "on github"))
-}
-
-func containsAny(s string, subs ...string) bool {
-	for _, sub := range subs {
-		if strings.Contains(s, sub) {
-			return true
-		}
-	}
-	return false
-}
-
 func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		return s[:i]
@@ -268,14 +238,6 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "\n\n[truncated]"
-}
-
-func usage() string {
-	return `GitHub navigator. Try:
-  "search llm agent framework"       — search repositories
-  "tokio-rs/tokio"                   — repository overview
-  "readme of a2aproject/a2a-go"      — fetch a repo's README
-  "list files in golang/go/src/net"  — browse a directory or file`
 }
 
 func extractText(msg *a2a.Message) string {
@@ -299,7 +261,7 @@ func main() {
 
 	agentCard := &a2a.AgentCard{
 		Name:        "GitHub Agent",
-		Description: "Search GitHub repositories and navigate their contents using GitHub's public API (no API key required, rate-limited to 60 req/hour)",
+		Description: "An LLM assistant that answers GitHub questions with live data: searches repositories, fetches repo overviews and READMEs, and browses file trees via GitHub's public API (no API key required, rate-limited to 60 req/hour)",
 		SupportedInterfaces: []*a2a.AgentInterface{
 			a2a.NewAgentInterface(fmt.Sprintf("http://0.0.0.0:%d/a2a", *port), a2a.TransportProtocolJSONRPC),
 		},
@@ -312,26 +274,26 @@ func main() {
 				Name:        "Search Repositories",
 				Description: "Search GitHub repositories by keyword, sorted by stars",
 				Tags:        []string{"github", "search", "repositories"},
-				Examples:    []string{"search rust async runtime", "find repos for a2a protocol"},
+				Examples:    []string{"search rust async runtime", "find the most popular a2a protocol repos"},
 			},
 			{
 				ID:          "repo_info",
 				Name:        "Repository Overview",
 				Description: "Get stars, forks, language, license, and topics for a repository",
 				Tags:        []string{"github", "repository", "stats"},
-				Examples:    []string{"tokio-rs/tokio", "tell me about golang/go"},
+				Examples:    []string{"tell me about golang/go", "how many stars does tokio-rs/tokio have?"},
 			},
 			{
 				ID:          "browse",
 				Name:        "Browse Contents",
 				Description: "List files in a repository directory, read a file, or fetch the README",
 				Tags:        []string{"github", "files", "readme", "navigate"},
-				Examples:    []string{"list files in golang/go/src/net", "readme of a2aproject/a2a-go"},
+				Examples:    []string{"what's in golang/go/src/net?", "summarize the README of a2aproject/a2a-go"},
 			},
 		},
 	}
 
-	handler := a2asrv.NewHandler(&githubExecutor{})
+	handler := a2asrv.NewHandler(&githubExecutor{llm: newLLMClient()})
 
 	mux := http.NewServeMux()
 	mux.Handle("/a2a", a2asrv.NewJSONRPCHandler(handler))

@@ -144,3 +144,23 @@ async fn fetch_returns_empty_for_unknown_session() {
     let h = SessionHistory::fetch("nonexistent-session-id-xyz", &pool, 20).await;
     assert!(h.is_empty());
 }
+
+#[tokio::test]
+#[ignore = "requires live Postgres database"]
+async fn fetch_topk_returns_empty_for_unknown_session() {
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/nasiko".to_string());
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let vs = nasiko_orchestrator::VectorStore::disabled();
+    let h = SessionHistory::fetch_topk(
+        "nonexistent-session-id-xyz",
+        &pool,
+        "query",
+        &vs,
+        20,
+        150,
+        &Default::default(),
+    )
+    .await;
+    assert!(h.is_empty());
+}

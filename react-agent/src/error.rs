@@ -1,4 +1,4 @@
-use crate::a2a::A2aClientError;
+use crate::a2a::{A2aClientError, PauseInfo};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OrchestratorError {
@@ -25,4 +25,17 @@ pub enum OrchestratorError {
 
     #[error("context serialization error: {0}")]
     Serialization(String),
+
+    /// Not a real failure — a called agent needs a human before this run can continue. Used only
+    /// by the non-streaming loop (`Orchestrator::run`); its `Ok` type has no room for "paused"
+    /// any more than `rig`'s own erased types did, so this is routed through `Err` for the same
+    /// reason `A2aToolError::AwaitingHuman` is. `pause` is boxed: `PauseInfo` is large enough
+    /// (several `String`s plus a `serde_json::Value`) that inlining it here would bloat every
+    /// `Result<_, OrchestratorError>` in this crate, not just this one variant's callers.
+    #[error("agent '{agent}' is awaiting a human")]
+    AwaitingHuman {
+        agent: String,
+        agent_id: String,
+        pause: Box<PauseInfo>,
+    },
 }

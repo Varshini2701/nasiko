@@ -15,8 +15,24 @@ impl UsageTracker {
     }
 
     /// Track token usage for an LLM call
-    /// Cost is auto-calculated by database trigger using model_pricing table
     pub async fn track_tokens(&self, usage: CreateTokenUsage) -> Result<Uuid, sqlx::Error> {
+        self.insert_tokens(usage, None).await
+    }
+
+    /// Persist a completion priced by the caller's shared engine.
+    pub async fn track_priced_tokens(
+        &self,
+        usage: CreateTokenUsage,
+        cost_usd: f64,
+    ) -> Result<Uuid, sqlx::Error> {
+        self.insert_tokens(usage, Some(cost_usd)).await
+    }
+
+    async fn insert_tokens(
+        &self,
+        usage: CreateTokenUsage,
+        cost_usd: Option<f64>,
+    ) -> Result<Uuid, sqlx::Error> {
         let id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO token_usage (
@@ -27,9 +43,9 @@ impl UsageTracker {
                 cached_tokens, audio_tokens, reasoning_tokens,
                 accepted_prediction_tokens, rejected_prediction_tokens,
                 completion_tokens_details, prompt_tokens_details,
-                latency_ms, ttft_ms, streaming, finish_reason, metadata
+                latency_ms, ttft_ms, streaming, finish_reason, metadata, cost_usd
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
             RETURNING id
             "#,
         )
@@ -57,6 +73,7 @@ impl UsageTracker {
         .bind(usage.streaming)
         .bind(usage.finish_reason)
         .bind(sqlx::types::Json(usage.metadata))
+        .bind(cost_usd)
         .fetch_one(&self.db)
         .await?;
 

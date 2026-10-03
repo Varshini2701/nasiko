@@ -13,7 +13,6 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use axum::{Json, Router, extract::State, routing::post};
-use nasiko_auth::jwt::mint_delegation_token;
 use nasiko_mcp_gateway::types::{codes, connector_prefix};
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -124,13 +123,16 @@ async fn start_stub_backend() -> (String, CallLog) {
 
 /// Fixture shared by every matrix test: one owner, one agent, one connector
 /// (backed by a live stub) registered through the real HTTP routes exactly the
-/// way an operator would, plus the delegation token an agent container would
-/// hold for `(owner, agent)`.
+/// way an operator would, plus the credentials an agent container would hold —
+/// its deploy-time gateway token and the traceparent of a live flow it
+/// participates in.
 struct Fixture {
     owner_id: String,
+    agent_id: Uuid,
     connector_id: Uuid,
     prefix: String,
     token: String,
+    traceparent: String,
     calls: CallLog,
 }
 
@@ -158,14 +160,16 @@ async fn setup_fixture(server: &common::TestServer) -> Fixture {
     .unwrap();
     disallow_private_urls();
 
-    let token =
-        mint_delegation_token(common::TEST_JWT_SECRET, &owner_id, &agent_id.to_string()).unwrap();
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+    let (_flow_id, traceparent) = common::open_flow(&server.db, owner_uuid, agent_id).await;
     let prefix = connector_prefix(connector_id);
     Fixture {
         owner_id,
+        agent_id,
         connector_id,
         prefix,
         token,
+        traceparent,
         calls,
     }
 }
@@ -183,7 +187,8 @@ impl Fixture {
         server
             .client
             .post(server.url("/api/mcp"))
-            .header("x-nasiko-agent-token", &self.token)
+            .bearer_auth(&self.token)
+            .header("traceparent", &self.traceparent)
             .json(&body)
             .send()
             .await
@@ -216,8 +221,7 @@ impl Fixture {
         let res = common::as_superuser(
             server.client.put(server.url(&format!(
                 "/api/mcp/agents/{}/connectors/{}",
-                self.agent_id_from_token(),
-                self.connector_id
+                self.agent_id, self.connector_id
             ))),
             &self.owner_id,
             "admin",
@@ -235,10 +239,9 @@ impl Fixture {
             .map(|(cid, pattern, stance)| json!({"connector_id": cid, "tool_pattern": pattern, "stance": stance}))
             .collect();
         let res = common::as_superuser(
-            server.client.put(server.url(&format!(
-                "/api/mcp/agents/{}/tools",
-                self.agent_id_from_token()
-            ))),
+            server
+                .client
+                .put(server.url(&format!("/api/mcp/agents/{}/tools", self.agent_id))),
             &self.owner_id,
             "admin",
         )
@@ -247,15 +250,6 @@ impl Fixture {
         .await
         .unwrap();
         assert_eq!(res.status(), 200, "setting tool rules must succeed");
-    }
-
-    /// The delegation token's `act` claim, decoded back out — avoids threading
-    /// `agent_id` through every helper call site separately.
-    fn agent_id_from_token(&self) -> String {
-        let (_user, agent) =
-            nasiko_auth::jwt::validate_delegation_token(common::TEST_JWT_SECRET, &self.token)
-                .unwrap();
-        agent
     }
 }
 

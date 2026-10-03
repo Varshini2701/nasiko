@@ -3,13 +3,17 @@
 //! precedence (resolved wins when set, else the request's), force non-streaming on the
 //! non-stream path, call the provider, and report the bare resolved model.
 //!
-//! Streaming is implemented in step 7; until then `chat_stream` returns an error.
+//! This spoke also serves every custom (DB-registered) endpoint, including Azure
+//! OpenAI. The bodies are identical across those; only the envelope — URL layout and
+//! credential header — differs, and that lives in [`ProviderDialect`] rather than in a
+//! forked copy of this file.
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use serde_json::json;
+use serde_json::{Value, json};
 
+use super::dialect::ProviderDialect;
 use super::sse::sse_data_stream;
 use super::{ProviderClient, ProviderError};
 use crate::ir::{ChatChunk, ChatRequest, ChatResponse, EmbeddingsRequest, EmbeddingsResponse};
@@ -19,11 +23,23 @@ pub struct OpenAiProvider {
     http: reqwest::Client,
     /// API base, e.g. `https://api.openai.com/v1` (overridable for tests).
     base: String,
+    /// Envelope this endpoint speaks — URL layout + credential header.
+    dialect: ProviderDialect,
 }
 
 impl OpenAiProvider {
+    /// A plain OpenAI-compatible endpoint at `base`.
     pub fn new(http: reqwest::Client, base: String) -> Self {
-        Self { http, base }
+        Self::with_dialect(http, base, ProviderDialect::OpenAi)
+    }
+
+    /// An OpenAI-shaped endpoint at `base` reached through `dialect`.
+    pub fn with_dialect(http: reqwest::Client, base: String, dialect: ProviderDialect) -> Self {
+        Self {
+            http,
+            base,
+            dialect,
+        }
     }
 
     /// Map a non-2xx provider response to a [`ProviderError`]. 429 and 5xx are
@@ -35,6 +51,47 @@ impl OpenAiProvider {
             retryable: status.as_u16() == 429 || status.is_server_error(),
         }
     }
+}
+
+/// The OpenAI `{"error":{"param":…,"code":"unsupported_…"}}` rejection shape: the name
+/// of a parameter the model does not accept, or `None` for any other 400.
+fn openai_droppable_param(body: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = body.get("error")?;
+    let code = error
+        .get("code")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default();
+    // Only these codes mean "this param/value isn't accepted here" — safe to drop.
+    if !matches!(code, "unsupported_value" | "unsupported_parameter") {
+        return None;
+    }
+    error
+        .get("param")
+        .and_then(|p| p.as_str())
+        .map(str::to_string)
+}
+
+/// The gpt-5.x reasoning-model rejection of function tools on `/v1/chat/completions`:
+/// `{"error":{"message":"Function tools with reasoning_effort are not supported for
+/// gpt-5.6 … set reasoning_effort to 'none'.","param":"reasoning_effort","code":null}}`.
+///
+/// [`openai_droppable_param`] cannot see this one — the `code` is null rather than an
+/// `unsupported_*` — and dropping would not help anyway: we never send `reasoning_effort`,
+/// so what the model rejects is its own default. The repair is to send it explicitly.
+/// Gated on both the named param and the remedy OpenAI itself prints, so it cannot
+/// misfire on another 400 that happens to mention the field.
+fn openai_reasoning_effort_repair(body: &str) -> Option<(String, Value)> {
+    let body: Value = serde_json::from_str(body).ok()?;
+    let error = body.get("error")?;
+    if error.get("param")?.as_str()? != "reasoning_effort" {
+        return None;
+    }
+    error
+        .get("message")?
+        .as_str()?
+        .contains("reasoning_effort to 'none'")
+        .then(|| ("reasoning_effort".to_string(), json!("none")))
 }
 
 #[async_trait]
@@ -58,9 +115,12 @@ impl ProviderClient for OpenAiProvider {
         out.stream = Some(false);
 
         let resp = self
-            .http
-            .post(format!("{}/chat/completions", self.base))
-            .bearer_auth(&cfg.api_key)
+            .dialect
+            .authorize(
+                self.http
+                    .post(self.dialect.chat_url(&self.base, &cfg.model)),
+                &cfg.api_key,
+            )
             .json(&out)
             .send()
             .await
@@ -102,9 +162,12 @@ impl ProviderClient for OpenAiProvider {
         );
 
         let resp = self
-            .http
-            .post(format!("{}/chat/completions", self.base))
-            .bearer_auth(&cfg.api_key)
+            .dialect
+            .authorize(
+                self.http
+                    .post(self.dialect.chat_url(&self.base, &cfg.model)),
+                &cfg.api_key,
+            )
             .json(&out)
             .send()
             .await
@@ -149,9 +212,12 @@ impl ProviderClient for OpenAiProvider {
         out.model = Some(cfg.model.clone());
 
         let resp = self
-            .http
-            .post(format!("{}/embeddings", self.base))
-            .bearer_auth(&cfg.api_key)
+            .dialect
+            .authorize(
+                self.http
+                    .post(self.dialect.embeddings_url(&self.base, &cfg.model)),
+                &cfg.api_key,
+            )
             .json(&out)
             .send()
             .await
@@ -176,6 +242,10 @@ impl ProviderClient for OpenAiProvider {
     /// that's the shape, return the param so the executor can drop it and retry the same
     /// model (dropping a param makes OpenAI apply its default — e.g. temperature → 1).
     /// This is general: any param OpenAI rejects this way is handled without special-casing.
+    ///
+    /// A dialect that reports the same class of failure differently (Azure names the
+    /// field in a bare message) gets a second look through
+    /// [`ProviderDialect::extra_droppable_param`].
     fn droppable_param(&self, err: &ProviderError) -> Option<String> {
         let ProviderError::Status {
             status, message, ..
@@ -186,26 +256,23 @@ impl ProviderClient for OpenAiProvider {
         if *status != 400 {
             return None;
         }
-        let body: serde_json::Value = serde_json::from_str(message).ok()?;
-        let error = body.get("error")?;
-        let code = error
-            .get("code")
-            .and_then(|c| c.as_str())
-            .unwrap_or_default();
-        let param = error.get("param").and_then(|p| p.as_str())?;
-        // Only these codes mean "this param/value isn't accepted here" — safe to drop.
-        // `invalid_value` is broader (could mean many things), so it's only trusted
-        // for `max_tokens`/`max_completion_tokens` — a cross-provider routing hop
-        // commonly carries a source model's default that exceeds the destination
-        // model's completion-token cap (e.g. Claude Code's default vs. gpt-4o-mini's
-        // 16384 limit); dropping it lets OpenAI fall back to its own default instead
-        // of failing the whole request.
-        let droppable = matches!(code, "unsupported_value" | "unsupported_parameter")
-            || (code == "invalid_value" && matches!(param, "max_tokens" | "max_completion_tokens"));
-        if !droppable {
+        openai_droppable_param(message).or_else(|| self.dialect.extra_droppable_param(message))
+    }
+
+    /// The one rejection class a drop cannot fix: a reasoning model refusing function
+    /// tools unless `reasoning_effort` is explicitly `"none"`. See
+    /// [`openai_reasoning_effort_repair`].
+    fn repairable_param(&self, err: &ProviderError) -> Option<(String, Value)> {
+        let ProviderError::Status {
+            status, message, ..
+        } = err
+        else {
+            return None;
+        };
+        if *status != 400 {
             return None;
         }
-        Some(param.to_string())
+        openai_reasoning_effort_repair(message)
     }
 }
 
@@ -216,6 +283,7 @@ mod tests {
 
     fn resolved(model: &str, temperature: Option<f64>) -> ResolvedConfig {
         ResolvedConfig {
+            compress_enabled: false,
             provider: "openai".into(),
             model: model.into(),
             litellm_model: format!("openai/{model}"),
@@ -229,6 +297,7 @@ mod tests {
             tier2_model: None,
             tier3_model: None,
             platform_paid: true,
+            custom_endpoint: None,
             is_coding_agent: false,
         }
     }
@@ -287,42 +356,193 @@ mod tests {
         );
     }
 
-    #[test]
-    fn droppable_param_accepts_invalid_value_only_for_max_tokens() {
-        let provider = OpenAiProvider::new(reqwest::Client::new(), "http://x".into());
-        // The exact error shape gpt-4o-mini returns for a cross-provider max_tokens
-        // default that exceeds its completion-token cap.
-        let too_large = ProviderError::Status {
+    /// The verbatim body a gpt-5.x reasoning model returns when a request carries
+    /// function tools — every Claude Code turn, which always sends its tool set.
+    fn reasoning_effort_rejection() -> ProviderError {
+        ProviderError::Status {
             status: 400,
             message: json!({
                 "error": {
-                    "message": "max_tokens is too large: 32000. This model supports at \
-                                most 16384 completion tokens, whereas you provided 32000.",
+                    "message": "Function tools with reasoning_effort are not supported for gpt-5.6 in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
                     "type": "invalid_request_error",
-                    "param": "max_tokens",
-                    "code": "invalid_value"
+                    "param": "reasoning_effort",
+                    "code": Value::Null
+                }
+            })
+            .to_string(),
+            retryable: false,
+        }
+    }
+
+    #[test]
+    fn repairable_param_recognizes_the_reasoning_effort_rejection() {
+        let provider = OpenAiProvider::new(reqwest::Client::new(), "http://x".into());
+        assert_eq!(
+            provider.repairable_param(&reasoning_effort_rejection()),
+            Some(("reasoning_effort".to_string(), json!("none")))
+        );
+    }
+
+    #[test]
+    fn the_two_recovery_seams_never_both_claim_an_error() {
+        let provider = OpenAiProvider::new(reqwest::Client::new(), "http://x".into());
+        // A drop cannot fix the reasoning rejection (we never sent the param), so the
+        // droppable seam must not claim it — its `code` is null, not `unsupported_*`.
+        assert_eq!(
+            provider.droppable_param(&reasoning_effort_rejection()),
+            None
+        );
+
+        // And the repair seam must not claim a plain droppable-param rejection.
+        let unsupported = ProviderError::Status {
+            status: 400,
+            message: json!({
+                "error": {
+                    "message": "Unsupported value: 'temperature' does not support 0.1 with this model.",
+                    "param": "temperature",
+                    "code": "unsupported_value"
                 }
             })
             .to_string(),
             retryable: false,
         };
-        assert_eq!(
-            provider.droppable_param(&too_large).as_deref(),
-            Some("max_tokens")
-        );
+        assert_eq!(provider.repairable_param(&unsupported), None);
+    }
 
-        // `invalid_value` on any other param is NOT trusted as droppable — it can mean
-        // many things (wrong type, out-of-range, malformed) beyond a capability
-        // mismatch, so only max_tokens/max_completion_tokens get this treatment.
-        let other_param_invalid_value = ProviderError::Status {
+    #[test]
+    fn repairable_param_ignores_anything_but_this_exact_rejection() {
+        let provider = OpenAiProvider::new(reqwest::Client::new(), "http://x".into());
+
+        // Right param, different complaint — no remedy to apply, so not repairable.
+        let other_complaint = ProviderError::Status {
             status: 400,
             message: json!({
-                "error": { "code": "invalid_value", "param": "temperature" }
+                "error": {
+                    "message": "Invalid value for 'reasoning_effort': expected one of low, medium, high.",
+                    "param": "reasoning_effort",
+                    "code": Value::Null
+                }
             })
             .to_string(),
             retryable: false,
         };
-        assert_eq!(provider.droppable_param(&other_param_invalid_value), None);
+        assert_eq!(provider.repairable_param(&other_complaint), None);
+
+        // The remedy text alone, under a different param, is not enough either.
+        let other_param = ProviderError::Status {
+            status: 400,
+            message: json!({
+                "error": {
+                    "message": "set reasoning_effort to 'none'",
+                    "param": "tools",
+                    "code": Value::Null
+                }
+            })
+            .to_string(),
+            retryable: false,
+        };
+        assert_eq!(provider.repairable_param(&other_param), None);
+
+        // 5xx / transport / unparseable bodies are never repairable.
+        assert_eq!(
+            provider.repairable_param(&ProviderError::Status {
+                status: 500,
+                message: "boom".into(),
+                retryable: true
+            }),
+            None
+        );
+        assert_eq!(
+            provider.repairable_param(&ProviderError::Transport("timeout".into())),
+            None
+        );
+        assert_eq!(
+            provider.repairable_param(&ProviderError::Status {
+                status: 400,
+                message: "not json".into(),
+                retryable: false
+            }),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn azure_dialect_addresses_the_deployment_with_an_api_key_header() {
+        // The whole point of the dialect: same body, different envelope. Azure puts the
+        // deployment in the path, demands `?api-version=`, and takes the credential in
+        // `api-key` — `Authorization: Bearer` there means an Entra ID token and fails.
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "POST",
+                "/openai/deployments/prod-gpt4o/chat/completions?api-version=2024-10-21",
+            )
+            .match_header("api-key", "sk-test")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .match_body(mockito::Matcher::PartialJson(
+                json!({ "model": "prod-gpt4o", "stream": false }),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "model": "gpt-4o-2024-08-06",
+                    "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let provider = OpenAiProvider::with_dialect(
+            reqwest::Client::new(),
+            server.url(),
+            ProviderDialect::AzureOpenAi {
+                api_version: "2024-10-21".into(),
+            },
+        );
+        let req: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .unwrap();
+        // The resolved "model" is the Azure deployment name.
+        let resp = provider
+            .chat(&req, &resolved("prod-gpt4o", None))
+            .await
+            .unwrap();
+
+        m.assert_async().await;
+        assert_eq!(resp.model, "prod-gpt4o");
+    }
+
+    #[test]
+    fn azure_param_rejection_without_a_param_field_is_still_droppable() {
+        // Azure rejects a param its api-version doesn't know with a bare message and no
+        // `param` field, so the OpenAI shape alone would miss it and the call would fail
+        // instead of retrying without the param.
+        let azure = OpenAiProvider::with_dialect(
+            reqwest::Client::new(),
+            "https://acme.openai.azure.com".into(),
+            ProviderDialect::AzureOpenAi {
+                api_version: "2023-05-15".into(),
+            },
+        );
+        let err = ProviderError::Status {
+            status: 400,
+            message: r#"{"error":{"code":"BadRequest","message":"Unrecognized request argument supplied: max_completion_tokens"}}"#.into(),
+            retryable: false,
+        };
+        assert_eq!(
+            azure.droppable_param(&err).as_deref(),
+            Some("max_completion_tokens")
+        );
+        // The plain dialect does not read Azure's shape.
+        let plain = OpenAiProvider::new(reqwest::Client::new(), "https://x".into());
+        assert_eq!(plain.droppable_param(&err), None);
     }
 
     #[tokio::test]

@@ -70,10 +70,14 @@ impl FinanceAgent {
             "temperature": 0.1,
         });
 
-        let resp = self
+        let mut req = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
+            .bearer_auth(&self.api_key);
+        if let Some(tp) = parent_cx.and_then(telemetry::traceparent_for_context) {
+            req = req.header("traceparent", tp);
+        }
+        let resp = req
             .json(&body)
             .send()
             .await

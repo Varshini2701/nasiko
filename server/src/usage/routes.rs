@@ -21,6 +21,22 @@ pub fn router() -> Router<AppState> {
         .route("/usage/by-model", get(by_model))
 }
 
+/// `token_usage` is a shared sink: as well as model spend it carries MCP tool
+/// calls, which are latency records with no tokens and no cost
+/// (`oss/docs/MCP_GATEWAY_DESIGN.md` §14 routes them here deliberately, so that
+/// per-agent reporting covers tool use without a second query surface).
+///
+/// Spend queries exclude them. Left in, a tool call counts as a request against
+/// a model, and because `TokenUsageBuilder` requires a model the tool's *name*
+/// lands in that column — so `GROUP BY model` reports `SLACK_LIST_CONVERSATIONS`
+/// beside `gpt-4o-mini`.
+///
+/// Excluding by name rather than selecting an allow-list of spend types is
+/// deliberate: a new spend type added later must not silently vanish from every
+/// cost figure. This way a new *non*-spend type inflates a request count
+/// instead, which is visible and harmless by comparison.
+const EXCLUDE_NON_SPEND: &str = "operation_type <> 'mcp_tool_call'";
+
 // ─── GET /usage/summary ────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -67,7 +83,7 @@ pub(crate) async fn summary(
 
     let from = Utc::now() - Duration::days(q.days);
 
-    let row = sqlx::query_as::<_, SummaryRow>(
+    let row = sqlx::query_as::<_, SummaryRow>(&format!(
         r#"SELECT
             COUNT(*)::bigint as request_count,
             COALESCE(SUM(input_tokens), 0)::bigint as total_input,
@@ -76,8 +92,8 @@ pub(crate) async fn summary(
             COALESCE(SUM(cost_usd)::double precision, 0) as total_cost,
             AVG(latency_ms)::double precision as avg_latency
         FROM token_usage
-        WHERE user_id = $1 AND created_at >= $2"#,
-    )
+        WHERE user_id = $1 AND created_at >= $2 AND {EXCLUDE_NON_SPEND}"#
+    ))
     .bind(user_id)
     .bind(from)
     .fetch_one(&state.db)
@@ -151,17 +167,17 @@ pub(crate) async fn history(
 
     let from = Utc::now() - Duration::days(q.days);
 
-    let rows = sqlx::query_as::<_, DailyUsage>(
+    let rows = sqlx::query_as::<_, DailyUsage>(&format!(
         r#"SELECT
             DATE(created_at) as date,
             COUNT(*)::bigint as request_count,
             COALESCE(SUM(total_tokens), 0)::bigint as total_tokens,
             COALESCE(SUM(cost_usd)::double precision, 0) as total_cost_usd
         FROM token_usage
-        WHERE user_id = $1 AND created_at >= $2
+        WHERE user_id = $1 AND created_at >= $2 AND {EXCLUDE_NON_SPEND}
         GROUP BY DATE(created_at)
-        ORDER BY date ASC"#,
-    )
+        ORDER BY date ASC"#
+    ))
     .bind(user_id)
     .bind(from)
     .fetch_all(&state.db)
@@ -186,7 +202,8 @@ pub(crate) struct PaginatedQuery {
     /// Page offset (default: 0).
     #[serde(default)]
     offset: i64,
-    /// Substring filter on agent name (`by-agent` only; ignored by `by-model`).
+    /// Case-insensitive substring filter: on the agent name for `by-agent`,
+    /// on the model name for `by-model`. Omitted or empty matches everything.
     q: Option<String>,
     /// Look-back window in days (default: 30).
     #[serde(default = "default_days")]
@@ -240,7 +257,7 @@ pub(crate) async fn by_agent(
 
     let from = Utc::now() - Duration::days(q.days);
 
-    let rows = sqlx::query_as::<_, AgentUsage>(
+    let rows = sqlx::query_as::<_, AgentUsage>(&format!(
         r#"SELECT
             tu.agent_id,
             a.name as agent_name,
@@ -254,10 +271,11 @@ pub(crate) async fn by_agent(
         LEFT JOIN agents a ON a.id = tu.agent_id
         WHERE tu.user_id = $1 AND tu.created_at >= $2
           AND ($3::text IS NULL OR a.name ILIKE '%' || $3 || '%')
+          AND tu.{EXCLUDE_NON_SPEND}
         GROUP BY tu.agent_id, a.name
         ORDER BY total_tokens DESC
-        LIMIT $4 OFFSET $5"#,
-    )
+        LIMIT $4 OFFSET $5"#
+    ))
     .bind(user_id)
     .bind(from)
     .bind(&q.q)
@@ -321,7 +339,7 @@ pub(crate) async fn by_model(
 
     let from = Utc::now() - Duration::days(q.days);
 
-    let rows = sqlx::query_as::<_, ModelUsage>(
+    let rows = sqlx::query_as::<_, ModelUsage>(&format!(
         r#"SELECT
             provider,
             model,
@@ -332,13 +350,15 @@ pub(crate) async fn by_model(
             COALESCE(SUM(cost_usd)::double precision, 0) as total_cost_usd,
             AVG(latency_ms)::double precision as avg_latency_ms
         FROM token_usage
-        WHERE user_id = $1 AND created_at >= $2
+        WHERE user_id = $1 AND created_at >= $2 AND {EXCLUDE_NON_SPEND}
+          AND ($3::text IS NULL OR model ILIKE '%' || $3 || '%')
         GROUP BY provider, model
         ORDER BY total_tokens DESC
-        LIMIT $3 OFFSET $4"#,
-    )
+        LIMIT $4 OFFSET $5"#
+    ))
     .bind(user_id)
     .bind(from)
+    .bind(&q.q)
     .bind(q.limit)
     .bind(q.offset)
     .fetch_all(&state.db)

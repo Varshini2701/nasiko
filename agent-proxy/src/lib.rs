@@ -19,6 +19,11 @@ pub struct ResolvedAgent {
     /// runtime lookup and treat a missing snapshot as fatal only when that
     /// lookup fails too.
     pub endpoint: Option<AgentEndpoint>,
+    /// The agent's A2A mount path (`agents.transport_path`, from its card) —
+    /// e.g. `/a2a` for the a2a-go agents, `/` for the a2a-server-lf agents.
+    /// `None`/empty/`/` mean root. The proxy must honor this: the A2A spec
+    /// fixes no path, so POSTing a message to `/` 404s agents mounted elsewhere.
+    pub transport_path: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -34,11 +39,13 @@ pub enum ResolveError {
 /// Resolve an agent ID to its catalog record (name + stored endpoint
 /// snapshot) from the database.
 pub async fn resolve(db: &PgPool, agent_id: Uuid) -> Result<ResolvedAgent, ResolveError> {
-    let agent = sqlx::query_as::<_, AgentRow>("SELECT name, status, url FROM agents WHERE id = $1")
-        .bind(agent_id)
-        .fetch_optional(db)
-        .await?
-        .ok_or(ResolveError::NotFound)?;
+    let agent = sqlx::query_as::<_, AgentRow>(
+        "SELECT name, status, url, transport_path FROM agents WHERE id = $1",
+    )
+    .bind(agent_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or(ResolveError::NotFound)?;
 
     if agent.status != "running" {
         return Err(ResolveError::NotRunning(agent.status));
@@ -54,6 +61,7 @@ pub async fn resolve(db: &PgPool, agent_id: Uuid) -> Result<ResolvedAgent, Resol
     Ok(ResolvedAgent {
         name: agent.name,
         endpoint,
+        transport_path: agent.transport_path,
     })
 }
 
@@ -74,4 +82,5 @@ struct AgentRow {
     name: String,
     status: String,
     url: Option<String>,
+    transport_path: Option<String>,
 }

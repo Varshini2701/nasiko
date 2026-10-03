@@ -1,6 +1,7 @@
 pub mod api;
 pub mod commands;
 pub mod config;
+pub mod hitl;
 pub mod oci;
 pub mod skill;
 pub mod util;
@@ -168,6 +169,17 @@ pub enum AgentOpsCommands {
         /// the mount hides whatever the image ships at that path
         #[arg(long, value_name = "PATH")]
         writable_path: Option<String>,
+    },
+    /// Deploy an agent from an OCI/artifact-registry reference
+    ///
+    /// The registry counterpart of `push` (local image) and `upload` (local
+    /// source): the control plane pulls the image itself, so no local Docker
+    /// is needed. The reference must include the registry host, which must be
+    /// listed in the server's REGISTRY_IMPORT_ALLOWED_HOSTS.
+    Import {
+        /// `owner/name[:tag]` (resolved against the connected registry, like
+        /// `nasiko new`) or a full `registry.host/owner/name[:tag]`
+        reference: String,
     },
     /// List running agents
     Ps {
@@ -500,6 +512,27 @@ pub enum MafCommands {
         #[command(subcommand)]
         command: MafExecutionCommands,
     },
+    /// Run one instruction end to end and report every stage
+    #[command(
+        after_help = "Does in one command what `workflow create --instruction`, \
+`workflow run --wait` and `execution get` do in three: sends the sentence to the decomposer, \
+shows how it was split and which agent each step was routed to, runs it while reporting each \
+step as it finishes, then prints the result with its token breakdown.\n\n\
+The workflow is kept by default so it can be re-run or inspected; pass --cleanup to delete it \
+once the run finishes."
+    )]
+    Trace {
+        /// The compound instruction to decompose into a workflow and run
+        instruction: String,
+        /// Run-time data folded into step 0's task before planning
+        #[arg(long)]
+        content: Option<String>,
+        /// Delete the workflow once the run finishes
+        #[arg(long)]
+        cleanup: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -510,11 +543,14 @@ pub enum MafWorkflowCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Create a workflow from one or more steps
+    /// Create a workflow from one or more steps, or from one compound instruction
     #[command(
         after_help = "Steps run in the order given. Pass --agent once per --step to pin \
 an agent (name or UUID) to that step, or \"-\" to auto-assign it; omit --agent entirely to \
-auto-assign every step via the routing engine."
+auto-assign every step via the routing engine.\n\n\
+--instruction is mutually exclusive with --step/--agent: it sends the whole sentence to the \
+decomposer service (MODEL_API_URL), which splits it into atomic steps; each is then \
+auto-assigned an agent exactly like an auto-assigned --step."
     )]
     Create {
         #[arg(long)]
@@ -522,11 +558,14 @@ auto-assign every step via the routing engine."
         #[arg(long)]
         description: Option<String>,
         /// A workflow step's task description. Repeat in order: --step "..." --step "..."
-        #[arg(long = "step")]
+        #[arg(long = "step", conflicts_with = "instruction")]
         steps: Vec<String>,
         /// Agent (name or UUID) for the step at the same position, or "-" to auto-assign
-        #[arg(long = "agent")]
+        #[arg(long = "agent", conflicts_with = "instruction")]
         agents: Vec<String>,
+        /// One compound instruction to split into atomic steps via the decomposer service
+        #[arg(long, conflicts_with_all = ["steps", "agents"])]
+        instruction: Option<String>,
     },
     /// Show a workflow's steps and metadata
     Get {
@@ -589,6 +628,11 @@ server-side patch API, so behind the scenes this still sends the full step list.
         /// Poll until the execution finishes and print its result
         #[arg(long)]
         wait: bool,
+        /// Run-time data for this execution only — folded into step 0's task
+        /// description before planning, so the same saved workflow can be
+        /// re-run against different content each time
+        #[arg(long)]
+        content: Option<String>,
     },
     /// List executions of one workflow
     Executions {
@@ -1014,6 +1058,7 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             writable,
             writable_path.as_deref(),
         ),
+        AgentOpsCommands::Import { reference } => commands::import::from_registry(&reference),
         AgentOpsCommands::Ps { json } => commands::agents::ps(json),
         AgentOpsCommands::Logs {
             agent,
@@ -1110,11 +1155,7 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                 // so `nasiko chat <agent-name>` sent the literal name as
                 // the HTTP endpoint instead of resolving it first.
                 (Some(u), _) => commands::agents::resolve_chat_target(&u)?,
-                (None, Some(a)) => {
-                    let base = config::active_url()?;
-                    let id = commands::agents::resolve_agent_id(&a)?;
-                    format!("{}/api/agents/{}", base.trim_end_matches('/'), id)
-                }
+                (None, Some(a)) => commands::agents::resolve_chat_target(&a)?,
                 (None, None) => {
                     let base = config::active_url()?;
                     format!("{}/api/orchestrator/a2a", base.trim_end_matches('/'))
@@ -1322,11 +1363,13 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                     description,
                     steps,
                     agents,
+                    instruction,
                 } => commands::maf::workflow_create(
                     name.as_deref(),
                     description.as_deref(),
                     &steps,
                     &agents,
+                    instruction.as_deref(),
                 ),
                 MafWorkflowCommands::Get { workflow, json } => {
                     commands::maf::workflow_get(&workflow, json)
@@ -1359,9 +1402,11 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                 MafWorkflowCommands::Delete { workflow, force } => {
                     commands::maf::workflow_delete(&workflow, force)
                 }
-                MafWorkflowCommands::Run { workflow, wait } => {
-                    commands::maf::workflow_run(&workflow, wait)
-                }
+                MafWorkflowCommands::Run {
+                    workflow,
+                    wait,
+                    content,
+                } => commands::maf::workflow_run(&workflow, wait, content.as_deref()),
                 MafWorkflowCommands::Executions { workflow, json } => {
                     commands::maf::workflow_executions(&workflow, json)
                 }
@@ -1375,6 +1420,12 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                     commands::maf::execution_result(&execution_id, json)
                 }
             },
+            MafCommands::Trace {
+                instruction,
+                content,
+                cleanup,
+                json,
+            } => commands::maf::trace(&instruction, content.as_deref(), cleanup, json),
         },
     }
 }
@@ -1403,6 +1454,50 @@ pub fn dispatch_registry(cmd: RegistrySubCommands) -> Result<()> {
             artifact_type,
             json,
         } => commands::registry::list(artifact_type.as_deref(), json),
+    }
+}
+
+// ─── Coding-agent integrations ──────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum IntegrationSubCommands {
+    /// Show which coding agents are on this machine and their reporting status
+    Status,
+    /// Register a coding agent and start reporting its sessions to Nasiko
+    Install {
+        /// Agent to install (e.g. claude or opencode)
+        agent: String,
+        /// Report tokens, latency and cost, but omit conversation text from spans
+        #[arg(long)]
+        no_content: bool,
+    },
+    /// Stop reporting a coding agent's sessions and remove its hook
+    Uninstall {
+        /// Agent to uninstall (e.g. claude or opencode)
+        agent: String,
+    },
+    /// Export one session's new turns. Invoked by the installed hook, not by hand.
+    #[command(hide = true)]
+    Report {
+        #[arg(long)]
+        agent: String,
+    },
+    /// Validate and deliver queued coding-agent events
+    Sync,
+}
+
+pub fn dispatch_integration(cmd: IntegrationSubCommands) -> Result<()> {
+    match cmd {
+        IntegrationSubCommands::Status => commands::integration::status(),
+        IntegrationSubCommands::Install { agent, no_content } => {
+            commands::integration::install(commands::integration::InstallOptions {
+                agent_id: &agent,
+                no_content,
+            })
+        }
+        IntegrationSubCommands::Uninstall { agent } => commands::integration::uninstall(&agent),
+        IntegrationSubCommands::Report { agent } => commands::integration::report(&agent),
+        IntegrationSubCommands::Sync => commands::integration::sync(),
     }
 }
 
@@ -2034,49 +2129,5 @@ pub fn dispatch_mcp(cmd: McpSubCommands) -> Result<()> {
                 commands::mcp::agent_tools_reset(&agent, yes)
             }
         },
-    }
-}
-
-// ─── Coding-agent integrations ──────────────────────────────────────────────
-
-#[derive(Subcommand)]
-pub enum IntegrationSubCommands {
-    /// Show which coding agents are on this machine and their reporting status
-    Status,
-    /// Register a coding agent and start reporting its sessions to Nasiko
-    Install {
-        /// Agent to install (e.g. claude or opencode)
-        agent: String,
-        /// Report tokens, latency and cost, but omit conversation text from spans
-        #[arg(long)]
-        no_content: bool,
-    },
-    /// Stop reporting a coding agent's sessions and remove its hook
-    Uninstall {
-        /// Agent to uninstall (e.g. claude or opencode)
-        agent: String,
-    },
-    /// Export one session's new turns. Invoked by the installed hook, not by hand.
-    #[command(hide = true)]
-    Report {
-        #[arg(long)]
-        agent: String,
-    },
-    /// Validate and deliver queued coding-agent events
-    Sync,
-}
-
-pub fn dispatch_integration(cmd: IntegrationSubCommands) -> Result<()> {
-    match cmd {
-        IntegrationSubCommands::Status => commands::integration::status(),
-        IntegrationSubCommands::Install { agent, no_content } => {
-            commands::integration::install(commands::integration::InstallOptions {
-                agent_id: &agent,
-                no_content,
-            })
-        }
-        IntegrationSubCommands::Uninstall { agent } => commands::integration::uninstall(&agent),
-        IntegrationSubCommands::Report { agent } => commands::integration::report(&agent),
-        IntegrationSubCommands::Sync => commands::integration::sync(),
     }
 }

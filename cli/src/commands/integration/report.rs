@@ -63,6 +63,7 @@ pub fn run(agent: Agent) -> Result<()> {
                 spec.id,
                 &agent_state.agent_name,
                 &snapshot.session_id,
+                snapshot.title.as_deref(),
                 turn,
                 agent_state.capture_content,
             ),
@@ -111,6 +112,7 @@ fn canonical_event(
     agent_id: &str,
     agent_name: &str,
     source_session_id: &str,
+    title: Option<&str>,
     turn: &Turn,
     capture_content: bool,
 ) -> CodingAgentEventV1 {
@@ -125,6 +127,9 @@ fn canonical_event(
         session: CodingAgentSession {
             id: coding_agent_session_id(agent_id, source_session_id),
             source_id: source_session_id.to_string(),
+            title: title.filter(|_| capture_content).map(|title| {
+                bounded_text_to(title, nasiko_types::CODING_AGENT_SESSION_TITLE_MAX_BYTES)
+            }),
         },
         turn: CodingAgentTurn {
             id: turn.uuid.clone(),
@@ -143,6 +148,7 @@ fn canonical_event(
                     output_tokens: call.output_tokens,
                     cache_read_tokens: call.cache_read_tokens,
                     cache_creation_tokens: call.cache_creation_tokens,
+                    accounting: call.accounting.clone(),
                     started_at: call.started_at,
                     ended_at: call.ended_at,
                 })
@@ -244,7 +250,7 @@ fn pending_turns(turns: &[Turn], captured: &HashSet<String>) -> Vec<Turn> {
 
 fn spawn_sync() -> Result<()> {
     Command::new(std::env::current_exe()?)
-        .args(["integration", "sync"])
+        .args(["agents", "sync"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -286,6 +292,7 @@ mod tests {
                     output_tokens: 1,
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
+                    accounting: None,
                     started_at: at,
                     ended_at: at,
                 })
@@ -386,11 +393,26 @@ mod tests {
             association: nasiko_types::CodingAgentToolAssociation::Exact,
             timestamp_quality: nasiko_types::CodingAgentTimestampQuality::Exact,
         });
-        let first = canonical_event("claude", "claude-code", "same", &turn, false);
-        let second = canonical_event("claude", "claude-code", "same", &turn, false);
+        let first = canonical_event(
+            "claude",
+            "claude-code",
+            "same",
+            Some("Claude session title"),
+            &turn,
+            false,
+        );
+        let second = canonical_event(
+            "claude",
+            "claude-code",
+            "same",
+            Some("Claude session title"),
+            &turn,
+            false,
+        );
         assert_eq!(first.event_id, second.event_id);
         assert_eq!(first, second);
         assert_eq!(first.session.id, "claude:same");
+        assert!(first.session.title.is_none());
         assert!(first.turn.prompt.is_none());
         assert!(first.turn.response.is_none());
         assert_eq!(first.turn.tool_calls[0].name, "Read");
@@ -400,12 +422,31 @@ mod tests {
         assert!(first.validate().is_ok());
         assert_ne!(
             first.event_id,
-            canonical_event("opencode", "opencode", "same", &turn, false).event_id
+            canonical_event(
+                "opencode",
+                "opencode",
+                "same",
+                Some("Claude session title"),
+                &turn,
+                false
+            )
+            .event_id
         );
-        let content = canonical_event("claude", "claude-code", "same", &turn, true);
+        let content = canonical_event(
+            "claude",
+            "claude-code",
+            "same",
+            Some("Claude session title"),
+            &turn,
+            true,
+        );
         assert_eq!(
             content.turn.tool_calls[0].arguments,
             Some(serde_json::json!({"path": "secret"}))
+        );
+        assert_eq!(
+            content.session.title.as_deref(),
+            Some("Claude session title")
         );
         assert!(content.validate().is_ok());
     }

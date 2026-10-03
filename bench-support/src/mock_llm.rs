@@ -20,7 +20,7 @@
 //! control-plane overhead (DB queries, tool/preamble construction, one LLM
 //! round trip), not multi-turn tool-calling latency.
 //!
-//! `ee/orchestrator`'s `LlmClient` (MAF background worker, idle unless flows
+//! the enterprise orchestrator's `LlmClient` (MAF background worker, idle unless flows
 //! are queued) also posts to `{base_url}/chat/completions` — the flat JSON
 //! branch here satisfies it too. `/v1/embeddings` is served for robustness
 //! though the bench harness keeps the seeded agent count under
@@ -90,7 +90,7 @@ fn streaming_completion() -> Response {
 
 /// Matches `rig::providers::openai::completion::CompletionResponse` (id,
 /// object, created, model, choices[].index/message{role,content}/finish_reason,
-/// usage{prompt_tokens,total_tokens}) — also satisfies `ee/orchestrator`'s
+/// usage{prompt_tokens,total_tokens}) — also satisfies the enterprise orchestrator's
 /// simpler `LlmClient`, which only reads `choices[0].message.content` and
 /// `usage.total_tokens`.
 fn flat_completion() -> Value {

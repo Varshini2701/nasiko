@@ -4,6 +4,11 @@ use sqlx::PgPool;
 
 use crate::{AuthError, AuthService, Identity, LoginResult, TOKEN_EXPIRY_SECS};
 
+/// Lock account after this many consecutive failed login attempts.
+const LOGIN_LOCKOUT_THRESHOLD: i32 = 3;
+/// Lockout duration in seconds (15 minutes).
+const LOGIN_LOCKOUT_DURATION_SECS: u64 = 15 * 60;
+
 /// DB-backed implementation of AuthService.
 /// Handles user lookup, password verification, token issuance, and revocation.
 #[derive(Clone)]
@@ -84,11 +89,13 @@ impl AuthService for AuthServiceImpl {
             is_superuser: bool,
             is_active: bool,
             access_secret_hash: String,
+            failed_login_attempts: i32,
+            locked_until: Option<chrono::DateTime<chrono::Utc>>,
         }
 
         let row: Option<CredRow> = sqlx::query_as(
             r#"SELECT u.id, u.username, u.is_superuser, u.is_active,
-                      uc.access_secret_hash
+                      uc.access_secret_hash, u.failed_login_attempts, u.locked_until
                FROM users u
                JOIN user_credentials uc ON uc.user_id = u.id
                WHERE (uc.access_key = $1 OR u.username = $1) AND u.deleted_at IS NULL"#,
@@ -97,20 +104,65 @@ impl AuthService for AuthServiceImpl {
         .fetch_optional(&self.db)
         .await?;
 
-        let row = row.ok_or(AuthError::InvalidCredentials)?;
+        let row = row.ok_or(AuthError::InvalidCredentials {
+            remaining_attempts: None,
+        })?;
 
         if !row.is_active {
             return Err(AuthError::Disabled);
         }
 
-        if !crate::verify_password_async(password, &row.access_secret_hash).await {
-            return Err(AuthError::InvalidCredentials);
-        }
-
-        let _ = sqlx::query("UPDATE users SET last_login = now() WHERE id = $1")
+        // Check lockout: 3 consecutive failures → locked for 15 minutes.
+        if let Some(locked_until) = row.locked_until {
+            let now = chrono::Utc::now();
+            if now < locked_until {
+                let remaining = (locked_until - now).num_seconds().max(0) as u64;
+                return Err(AuthError::AccountLocked {
+                    retry_after_secs: remaining,
+                });
+            }
+            // Lockout expired — clear it so the attempt proceeds.
+            let _ = sqlx::query(
+                "UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = $1",
+            )
             .bind(row.id)
             .execute(&self.db)
             .await;
+        }
+
+        if !crate::verify_password_async(password, &row.access_secret_hash).await {
+            let attempts = row.failed_login_attempts + 1;
+            if attempts >= LOGIN_LOCKOUT_THRESHOLD {
+                let _ = sqlx::query(
+                    "UPDATE users SET failed_login_attempts = $2, \
+                     locked_until = now() + interval '15 minutes' WHERE id = $1",
+                )
+                .bind(row.id)
+                .bind(attempts)
+                .execute(&self.db)
+                .await;
+                return Err(AuthError::AccountLocked {
+                    retry_after_secs: LOGIN_LOCKOUT_DURATION_SECS,
+                });
+            }
+            let _ = sqlx::query("UPDATE users SET failed_login_attempts = $2 WHERE id = $1")
+                .bind(row.id)
+                .bind(attempts)
+                .execute(&self.db)
+                .await;
+            let remaining = LOGIN_LOCKOUT_THRESHOLD - attempts;
+            return Err(AuthError::InvalidCredentials {
+                remaining_attempts: Some(remaining),
+            });
+        }
+
+        // Successful login — reset failed attempts and update last_login.
+        let _ = sqlx::query(
+            "UPDATE users SET last_login = now(), failed_login_attempts = 0, locked_until = NULL WHERE id = $1",
+        )
+        .bind(row.id)
+        .execute(&self.db)
+        .await;
 
         let identity = Identity {
             user_id: row.id.to_string(),
@@ -259,8 +311,15 @@ impl AuthService for AuthServiceImpl {
                 let email = verified_email
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("{}@{}.users", username, provider));
+                // ON CONFLICT: if the username already exists (e.g. the
+                // provider label changed since a previous login, or the user
+                // was seeded manually), link to the existing row rather than
+                // failing — the identity row created below is what matters.
                 let row: (uuid::Uuid,) = sqlx::query_as(
-                    "INSERT INTO users (username, email, is_superuser, is_active, last_login) VALUES ($1, $2, false, true, now()) RETURNING id",
+                    "INSERT INTO users (username, email, is_superuser, is_active, last_login) \
+                     VALUES ($1, $2, false, true, now()) \
+                     ON CONFLICT (username) DO UPDATE SET last_login = now() \
+                     RETURNING id",
                 )
                 .bind(username)
                 .bind(&email)

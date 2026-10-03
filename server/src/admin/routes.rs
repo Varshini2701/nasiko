@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
@@ -102,6 +102,8 @@ async fn deploy(
             Some(owner_id),
         )
         .await;
+        // Per-agent MCP gateway credential (rotates on redeploy).
+        crate::mcp::wiring::inject_agent_gateway_token(&state.db, &mut env, agent_id).await;
     }
 
     // UUID-key when the name maps to a catalog agent; fall back to name-keying only
@@ -110,6 +112,37 @@ async fn deploy(
         Some(agent_id) => ContainerId::from_uuid(agent_id),
         None => ContainerId::new(&req.name),
     };
+
+    // `--writable` is a durable property of a registered agent (persisted in the
+    // `agents` row by whichever on-ramp first set it), not a per-deploy flag.
+    // Source it from the catalog so an ad-hoc redeploy through this path — e.g. a
+    // UI "redeploy" that doesn't re-send the flag — can never silently detach a
+    // live volume and drop the agent's files. An explicit request flag still wins
+    // (so `nasiko deploy --writable` of an as-yet-unregistered image works too).
+    let (db_writable, db_writable_path) = match resolved_agent_id {
+        Some(agent_id) => match sqlx::query_as::<_, (bool, Option<String>)>(
+            "SELECT writable, writable_path FROM agents WHERE id = $1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&state.db)
+        .await
+        {
+            // A missing row is a genuinely ad-hoc image with no catalog record —
+            // `false` is correct there. A DB *error*, though, must NOT collapse to
+            // `false`: that would deploy a writable agent with no volume and then
+            // persist `writable=false`, the exact silent detach this block exists
+            // to prevent. Fail the deploy instead of guessing.
+            Ok(row) => row.unwrap_or((false, None)),
+            Err(e) => {
+                tracing::error!(%e, %agent_id, "deploy: could not read writable from catalog");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+                    .into_response();
+            }
+        },
+        None => (false, None),
+    };
+    let writable_path = req.writable_path.clone().or(db_writable_path);
+    let writable = req.writable || db_writable || writable_path.is_some();
 
     let ports = if req.ports.is_empty() {
         vec![crate::agents::DEFAULT_AGENT_PORT]
@@ -135,11 +168,11 @@ async fn deploy(
         harden: false,
         network_override: None,
         workload_kind: Default::default(),
-        // A path implies the mount — requiring both flags would make
-        // `--writable-path X` alone silently deploy without storage.
-        writable: req.writable || req.writable_path.is_some(),
-        writable_path: req.writable_path.clone(),
+        // Sourced from the catalog (see above) so redeploys keep the mount.
+        writable,
+        writable_path,
         owner_id,
+        force_pull: false,
     };
     // Only a name that already maps to a registered catalog agent has an
     // `agents` row to scope a pull credential to (see pull_credentials'
@@ -169,6 +202,13 @@ async fn deploy(
                         .await;
                 let image = spec.image.clone();
                 let owner_id = claims.user_uuid().ok();
+                // Persist the effective writable config so it survives on the
+                // agents row. Without this, a deploy that turned an agent
+                // writable here would leave `writable=false` in the catalog, and
+                // the next restart/update/rollback (which read the flag from the
+                // row, not the request) would silently redeploy with no volume.
+                let spec_writable = spec.writable;
+                let spec_writable_path = spec.writable_path.clone();
 
                 // Probe the agent's card and persist `transport_path` (plus
                 // description/skills/tags/capabilities) — the same probe the
@@ -192,11 +232,13 @@ async fn deploy(
                     // the catalog, so restart (which needs `image` to redeploy) works
                     // for agents deployed through this ad-hoc path too.
                     let _ = sqlx::query(
-                        "UPDATE agents SET url = COALESCE(NULLIF($1, ''), url), image = $2, status = 'running', updated_at = now() WHERE id = $3",
+                        "UPDATE agents SET url = COALESCE(NULLIF($1, ''), url), image = $2, status = 'running', writable = $4, writable_path = $5, updated_at = now() WHERE id = $3",
                     )
                     .bind(&endpoint)
                     .bind(&image)
                     .bind(agent_id)
+                    .bind(spec_writable)
+                    .bind(&spec_writable_path)
                     .execute(&db)
                     .await;
 
@@ -365,10 +407,22 @@ async fn start(
     }
 }
 
+#[derive(Deserialize, Default)]
+struct RestartQuery {
+    /// `?refresh=true` — force a fresh registry pull of this agent's image
+    /// before recreating the container, bypassing Docker's local cache. For
+    /// a mutable tag (e.g. `:latest`), this is what actually picks up a new
+    /// push instead of silently reusing whatever was pulled last time.
+    /// Defaults to `false` (existing behavior: reuse the cached image).
+    #[serde(default)]
+    refresh: bool,
+}
+
 async fn restart(
     State(state): State<AppState>,
     claims: Claims,
     Path(name): Path<String>,
+    Query(query): Query<RestartQuery>,
 ) -> impl IntoResponse {
     // Look up agent record to get image and owner. `agents` has no `port` column
     // (that lives on `agent_deployments.spec_ports`, used by the catalog-aware
@@ -473,6 +527,8 @@ async fn restart(
     // Inject LLM router wiring so the redeployed agent routes through the gateway.
     crate::llm_router::wiring::inject_agent_llm_env(&state.db, &mut env, agent_id, Some(owner_id))
         .await;
+    // Per-agent MCP gateway credential (rotates on redeploy).
+    crate::mcp::wiring::inject_agent_gateway_token(&state.db, &mut env, agent_id).await;
 
     // Destroy the UUID-keyed workload (post-fix); fall back to the name-keyed one
     // for pre-fix containers so we don't leave a stale duplicate running.
@@ -495,6 +551,7 @@ async fn restart(
         writable_path,
         owner_id,
     );
+    spec.force_pull = query.refresh;
     crate::agents::attach_pull_credential(
         &state.db,
         &state.config.agent_runtime,
@@ -645,7 +702,7 @@ async fn record_lifecycle_status(state: &AppState, name: &str, status: &str) {
     // - Bringing an agent UP may only touch the newest row. An agent-wide sweep
     //   would resurrect every historical row as `running`, which is not just a
     //   smudged history — EE's crash guardian polls *every* row in
-    //   ('starting','running') (ee/server/src/crash_guardian.rs), so each stale
+    //   ('starting','running') (the EE crash guardian), so each stale
     //   row becomes a phantom deployment it probes and can mark crashed.
     // - Taking one DOWN sweeps the agent, matching `destroy` above. Nothing of
     //   this agent's is running afterwards, so any row still claiming otherwise
@@ -705,6 +762,7 @@ async fn resolve_agent_id_by_name(state: &AppState, name_or_id: &str) -> Option<
 /// secrets) of any OTHER team's agent just by knowing its name. The RUN-2b
 /// keying fix made this more directly reachable — these ops now resolve to the
 /// *correct* container instead of a name-keyed one that likely didn't exist.
+#[allow(clippy::result_large_err)]
 async fn resolve_authorized_container(
     state: &AppState,
     claims: &Claims,
@@ -766,6 +824,32 @@ async fn resolve_full_env(
     }
     env.entry("OPENAI_MODEL".into())
         .or_insert_with(|| state.config.openai_model.clone());
+
+    // 4. Same reasoning as the platform-LLM-config gap above, same fix shape —
+    // this is a plain `agents` column (migration 0032), not a secret, so it's
+    // not in `agent_secrets` at all. Unconditional insert, not `.or_insert`:
+    // guards against a stale CODING_AGENT_MINIMAL_CODE secret a pre-migration
+    // agent might still carry in `secrets_env` (see the matching comment in
+    // `AppState::agent_env`, state.rs). The outer `deploy()` caller's own
+    // `entry().or_insert()` merge still lets an explicit `-e
+    // CODING_AGENT_MINIMAL_CODE=...` on this specific request win over it.
+    let minimal_code_enabled: Option<bool> =
+        sqlx::query_scalar("SELECT minimal_code_enabled FROM agents WHERE id = $1")
+            .bind(agent_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    let minimal_code_enabled = minimal_code_enabled.unwrap_or(false);
+    tracing::info!(
+        %agent_id,
+        minimal_code_enabled,
+        "resolve_full_env: injecting CODING_AGENT_MINIMAL_CODE"
+    );
+    env.insert(
+        "CODING_AGENT_MINIMAL_CODE".into(),
+        minimal_code_enabled.to_string(),
+    );
 
     env
 }

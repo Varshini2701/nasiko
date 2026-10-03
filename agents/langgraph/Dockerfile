@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir \
     pydantic>=2.10.6 \
     python-dotenv>=1.1.0 \
     uvicorn>=0.34.2 \
-    "a2a-sdk[http-server]==0.3.26" \
+    "a2a-sdk[http-server]==1.1.1" \
     "opentelemetry-sdk>=1.25.0" \
     "opentelemetry-distro>=0.46b0" \
     "opentelemetry-exporter-otlp>=1.25.0" \

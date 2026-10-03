@@ -16,6 +16,9 @@ nasiko-config = { workspace = true }
 nasiko-auth = { workspace = true }
 nasiko-runtime = { workspace = true, features = ["simulated"] }
 nasiko-server = { workspace = true }
+# For `S3Storage` — the bench harness builds the same object store the OSS
+# composition root does, since `AppState` now receives it.
+nasiko-oci = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 sqlx = { workspace = true }

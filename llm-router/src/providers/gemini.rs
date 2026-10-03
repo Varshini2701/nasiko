@@ -74,7 +74,7 @@ impl ProviderClient for GeminiProvider {
             .json()
             .await
             .map_err(|e| ProviderError::Parse(e.to_string()))?;
-        Ok(from_gemini_response(&value, &cfg.model))
+        from_gemini_response(&value, &cfg.model)
     }
 
     async fn chat_stream(
@@ -127,9 +127,25 @@ impl ProviderClient for GeminiProvider {
                 }
                 let response: Value = match serde_json::from_str(&payload) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(error) => {
+                        yield Err(ProviderError::Parse(format!("invalid Gemini stream event: {error}")));
+                        return;
+                    }
                 };
-                let candidate = &response["candidates"][0];
+                if let Some(error) = response.get("error") {
+                    let status = error["code"].as_u64().and_then(|code| u16::try_from(code).ok()).unwrap_or(502);
+                    let message = error["message"].as_str().unwrap_or("Gemini stream error");
+                    yield Err(ProviderError::Status {
+                        status,
+                        message: message.to_string(),
+                        retryable: false,
+                    });
+                    return;
+                }
+                let Some(candidate) = response["candidates"].as_array().and_then(|c| c.first()) else {
+                    yield Err(ProviderError::Parse("Gemini stream event has no candidate".into()));
+                    return;
+                };
 
                 if !role_sent {
                     yield Ok(delta_chunk(&id, &model, Delta {
@@ -175,21 +191,37 @@ impl ProviderClient for GeminiProvider {
                 }
 
                 if let Some(fr) = candidate["finishReason"].as_str() {
-                    finish = Some(if fr == "MAX_TOKENS" { "length" } else { "stop" }.to_string());
+                    finish = Some(map_finish_reason(fr).to_string());
                 }
                 if let Some(um) = response.get("usageMetadata") {
+                    let cached = um["cachedContentTokenCount"].as_i64();
                     usage = Some(Usage {
-                        prompt_tokens: um["promptTokenCount"].as_i64(),
+                        // promptTokenCount INCLUDES cachedContentTokenCount; the
+                        // cost trigger charges input and cache-read separately,
+                        // so report only the uncached remainder (see
+                        // `Usage::normalize_openai_details`).
+                        prompt_tokens: uncached_prompt(um["promptTokenCount"].as_i64(), cached),
                         completion_tokens: um["candidatesTokenCount"].as_i64(),
                         total_tokens: um["totalTokenCount"].as_i64(),
+                        cache_read_input_tokens: cached,
+                        cache_creation_input_tokens: None,
+            cache_creation: None,
+                        prompt_tokens_details: None,
                     });
                 }
             }
 
+            let Some(finish) = finish else {
+                yield Err(ProviderError::Parse("Gemini stream ended without finishReason".into()));
+                return;
+            };
             let finish_reason = if saw_tool_call {
-                "tool_calls".to_string()
+                match finish.as_str() {
+                    "stop" => "tool_calls".to_string(),
+                    _ => finish,
+                }
             } else {
-                finish.unwrap_or_else(|| "stop".to_string())
+                finish
             };
             yield Ok(finish_chunk(&id, &model, finish_reason));
             if let Some(u) = usage {
@@ -276,6 +308,22 @@ impl ProviderClient for GeminiProvider {
 }
 
 // ── OpenAI → Gemini (request) ────────────────────────────────────────────────
+
+/// Gemini's `promptTokenCount` is **cache-inclusive**: it counts the tokens
+/// served from `cachedContentTokenCount` as well as the fresh ones. The billing
+/// trigger (`calculate_token_cost`) charges `input_tokens` at the full input
+/// rate and adds `cache_read_input_tokens` at the cache rate, so passing the
+/// gross count through bills the cached portion twice. Report the remainder.
+///
+/// Clamped at zero: the subtraction should never go negative, but a provider
+/// reporting a larger cached count than prompt count must not produce a
+/// negative token count that the cost trigger would read as a credit.
+fn uncached_prompt(prompt: Option<i64>, cached: Option<i64>) -> Option<i64> {
+    match (prompt, cached) {
+        (Some(prompt), Some(cached)) => Some((prompt - cached).max(0)),
+        (prompt, _) => prompt,
+    }
+}
 
 fn to_gemini_request(req: &ChatRequest, cfg: &ResolvedConfig) -> Value {
     let mut system_parts: Vec<String> = Vec::new();
@@ -409,8 +457,11 @@ fn tool_choice_to_gemini(choice: &Value) -> Option<Value> {
 
 // ── Gemini → OpenAI (response) ───────────────────────────────────────────────
 
-fn from_gemini_response(body: &Value, model: &str) -> ChatResponse {
-    let candidate = &body["candidates"][0];
+fn from_gemini_response(body: &Value, model: &str) -> Result<ChatResponse, ProviderError> {
+    let candidate = body["candidates"]
+        .as_array()
+        .and_then(|candidates| candidates.first())
+        .ok_or_else(|| ProviderError::Parse("Gemini response has no candidates".into()))?;
 
     let mut text = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -445,19 +496,28 @@ fn from_gemini_response(body: &Value, model: &str) -> ChatResponse {
         Some(Value::String(text))
     };
 
-    let finish_reason = if !tool_calls.is_empty() {
+    let provider_finish = candidate["finishReason"]
+        .as_str()
+        .ok_or_else(|| ProviderError::Parse("Gemini response has no finishReason".into()))?;
+    let mapped_finish = map_finish_reason(provider_finish);
+    let finish_reason = if !tool_calls.is_empty() && mapped_finish == "stop" {
         "tool_calls"
     } else {
-        match candidate["finishReason"].as_str() {
-            Some("MAX_TOKENS") => "length",
-            _ => "stop", // STOP / unknown
-        }
+        mapped_finish
     };
 
-    let usage = body.get("usageMetadata").map(|u| Usage {
-        prompt_tokens: u["promptTokenCount"].as_i64(),
-        completion_tokens: u["candidatesTokenCount"].as_i64(),
-        total_tokens: u["totalTokenCount"].as_i64(),
+    let usage = body.get("usageMetadata").map(|u| {
+        let cached = u["cachedContentTokenCount"].as_i64();
+        Usage {
+            // See `uncached_prompt` — promptTokenCount is cache-inclusive.
+            prompt_tokens: uncached_prompt(u["promptTokenCount"].as_i64(), cached),
+            completion_tokens: u["candidatesTokenCount"].as_i64(),
+            total_tokens: u["totalTokenCount"].as_i64(),
+            cache_read_input_tokens: cached,
+            cache_creation_input_tokens: None,
+            cache_creation: None,
+            prompt_tokens_details: None,
+        }
     });
 
     let id = body["responseId"]
@@ -465,7 +525,7 @@ fn from_gemini_response(body: &Value, model: &str) -> ChatResponse {
         .map(str::to_string)
         .unwrap_or_else(|| format!("gemini-{}", now_unix()));
 
-    ChatResponse {
+    Ok(ChatResponse {
         id: format!("chatcmpl-{id}"),
         object: "chat.completion".to_string(),
         created: Some(now_unix()),
@@ -484,6 +544,16 @@ fn from_gemini_response(body: &Value, model: &str) -> ChatResponse {
         }],
         usage,
         extra: Map::new(),
+    })
+}
+
+fn map_finish_reason(reason: &str) -> &'static str {
+    match reason {
+        "STOP" => "stop",
+        "MAX_TOKENS" => "length",
+        // Gemini adds blocking reasons over time. Anything except the two successful
+        // terminals above must fail closed rather than become an executable response.
+        _ => "content_filter",
     }
 }
 
@@ -493,6 +563,7 @@ mod tests {
 
     fn resolved() -> ResolvedConfig {
         ResolvedConfig {
+            compress_enabled: false,
             provider: "gemini".into(),
             model: "gemini-1.5-pro".into(),
             litellm_model: "gemini/gemini-1.5-pro".into(),
@@ -506,6 +577,7 @@ mod tests {
             tier2_model: None,
             tier3_model: None,
             platform_paid: true,
+            custom_endpoint: None,
             is_coding_agent: false,
         }
     }
@@ -581,6 +653,40 @@ mod tests {
     }
 
     #[test]
+    fn mixed_assistant_text_and_multiple_calls_round_trip_to_gemini() {
+        let req: ChatRequest = serde_json::from_value(json!({
+            "messages":[
+                {"role":"user","content":"go"},
+                {"role":"assistant","content":"Calling both.","tool_calls":[
+                    {"id":"c1","type":"function","function":{"name":"one","arguments":"{\"x\":1}"}},
+                    {"id":"c2","type":"function","function":{"name":"two","arguments":"{\"y\":2}"}}
+                ]},
+                {"role":"tool","tool_call_id":"c1","content":"one done"},
+                {"role":"tool","tool_call_id":"c2","content":"two done"}
+            ]
+        }))
+        .unwrap();
+        let body = to_gemini_request(&req, &resolved());
+        assert_eq!(body["contents"][1]["parts"][0]["text"], "Calling both.");
+        assert_eq!(
+            body["contents"][1]["parts"][1]["functionCall"]["name"],
+            "one"
+        );
+        assert_eq!(
+            body["contents"][1]["parts"][2]["functionCall"]["name"],
+            "two"
+        );
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "one"
+        );
+        assert_eq!(
+            body["contents"][2]["parts"][1]["functionResponse"]["name"],
+            "two"
+        );
+    }
+
+    #[test]
     fn response_function_call_becomes_tool_calls() {
         let gemini = json!({
             "candidates": [{
@@ -591,7 +697,7 @@ mod tests {
             }],
             "usageMetadata": { "promptTokenCount": 20, "candidatesTokenCount": 8, "totalTokenCount": 28 }
         });
-        let resp = from_gemini_response(&gemini, "gemini-1.5-pro");
+        let resp = from_gemini_response(&gemini, "gemini-1.5-pro").unwrap();
         assert_eq!(resp.model, "gemini-1.5-pro");
         // STOP finishReason overridden to tool_calls because a call is present
         assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("tool_calls"));
@@ -617,13 +723,39 @@ mod tests {
             }],
             "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 2, "totalTokenCount": 7 }
         });
-        let resp = from_gemini_response(&gemini, "gemini-1.5-pro");
+        let resp = from_gemini_response(&gemini, "gemini-1.5-pro").unwrap();
         assert_eq!(
             resp.choices[0].message.content,
             Some(Value::String("Hello there".into()))
         );
         assert!(resp.choices[0].message.tool_calls.is_none());
         assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn finish_reasons_fail_closed_and_missing_candidates_are_errors() {
+        for reason in [
+            "SAFETY",
+            "RECITATION",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "SPII",
+            "MALFORMED_FUNCTION_CALL",
+            "FUTURE_BLOCK_REASON",
+        ] {
+            let response = from_gemini_response(
+                &json!({"candidates":[{"content":{"parts":[]},"finishReason":reason}]}),
+                "m",
+            )
+            .unwrap();
+            assert_eq!(
+                response.choices[0].finish_reason.as_deref(),
+                Some("content_filter"),
+                "accepted {reason}"
+            );
+        }
+        assert!(from_gemini_response(&json!({"candidates":[]}), "m").is_err());
+        assert!(from_gemini_response(&json!({}), "m").is_err());
     }
 
     #[tokio::test]
@@ -729,6 +861,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_rejects_malformed_error_and_premature_eof() {
+        for payload in [
+            "data: {not-json}\n\n",
+            "data: {\"error\":{\"code\":503,\"message\":\"unavailable\"}}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock(
+                    "POST",
+                    "/models/gemini-1.5-pro:streamGenerateContent?alt=sse",
+                )
+                .with_status(200)
+                .with_header("content-type", "text/event-stream")
+                .with_body(payload)
+                .create_async()
+                .await;
+            let provider = GeminiProvider::new(reqwest::Client::new(), server.url());
+            let req: ChatRequest =
+                serde_json::from_value(json!({"messages":[{"role":"user","content":"hi"}]}))
+                    .unwrap();
+            let results: Vec<_> = provider
+                .chat_stream(&req, &resolved())
+                .await
+                .unwrap()
+                .collect()
+                .await;
+            assert!(results.iter().any(Result::is_err), "accepted {payload}");
+            assert!(
+                !results
+                    .iter()
+                    .filter_map(|result| result.as_ref().ok())
+                    .any(|chunk| chunk
+                        .choices
+                        .first()
+                        .is_some_and(|choice| choice.finish_reason.is_some()))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn embeddings_via_batch_embed_contents() {
         let mut server = mockito::Server::new_async().await;
         server
@@ -795,5 +969,23 @@ mod tests {
         assert_eq!(resp.model, "gemini-1.5-pro");
         assert_eq!(resp.choices[0].message.text().as_deref(), Some("ok"));
         assert_eq!(resp.usage.unwrap().total_tokens, Some(4));
+    }
+
+    #[test]
+    fn gemini_prompt_count_excludes_cached_content() {
+        // promptTokenCount is cache-inclusive; billing charges input and
+        // cache-read separately, so the gross count double-bills the cache.
+        assert_eq!(uncached_prompt(Some(10000), Some(8000)), Some(2000));
+    }
+
+    #[test]
+    fn gemini_prompt_count_passes_through_without_cache() {
+        assert_eq!(uncached_prompt(Some(10000), None), Some(10000));
+        assert_eq!(uncached_prompt(None, Some(8000)), None);
+    }
+
+    #[test]
+    fn gemini_prompt_count_clamps_instead_of_going_negative() {
+        assert_eq!(uncached_prompt(Some(100), Some(640)), Some(0));
     }
 }

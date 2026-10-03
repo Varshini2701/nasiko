@@ -178,7 +178,7 @@ fn is_source_media_type(media_type: &str) -> bool {
 //
 // `docker_save`/`parse_docker_tar`/`build_oci_manifest`/`sha256_digest` are
 // pure conversion logic with no dependency on where the result gets pushed —
-// `ee/cli` reuses them (via `nasiko::oci::...`, since it already depends on
+// The enterprise CLI reuses them (via `nasiko::oci::...`, since it already depends on
 // this crate for `dispatch_agent_dev`/`dispatch_agent_ops`/`dispatch_registry`)
 // to publish images to the artifact registry, while `push_image` above keeps
 // pushing to this cluster's own OCI registry. Same conversion, different
@@ -221,6 +221,169 @@ pub fn local_image_exists(image: &str) -> Result<bool> {
             format!("failed to run `{bin} image inspect` — is the container runtime running?")
         })?;
     Ok(status.success())
+}
+
+/// One image manifest inside an OCI layout, with the blobs it references.
+pub struct OciChildManifest {
+    /// Digest of `bytes` — the reference this manifest must be pushed under so
+    /// the index's descriptor stays valid.
+    pub digest: String,
+    pub media_type: String,
+    /// `os/arch`, or `unknown/unknown` for buildx attestation manifests.
+    pub platform: String,
+    pub bytes: Vec<u8>,
+    /// Config + layer blobs this manifest references, as (digest, data).
+    pub blobs: Vec<(String, Vec<u8>)>,
+}
+
+/// A multi-platform image exported by `docker save`, parsed from the OCI layout.
+pub struct OciLayout {
+    /// The image index (manifest list), verbatim as exported.
+    pub index: serde_json::Value,
+    pub children: Vec<OciChildManifest>,
+}
+
+impl OciLayout {
+    /// Platforms carried by real image manifests (attestations excluded).
+    pub fn platforms(&self) -> Vec<&str> {
+        self.children
+            .iter()
+            .map(|c| c.platform.as_str())
+            .filter(|p| *p != "unknown/unknown")
+            .collect()
+    }
+}
+
+/// Parse the OCI layout that `docker save` writes alongside the legacy
+/// `manifest.json`, preserving every platform.
+///
+/// `manifest.json` describes only the host platform, so a publisher that reads
+/// it collapses a multi-arch image to one architecture. `index.json` carries the
+/// full manifest list; this walks it (the top-level index nests the real image
+/// index) and returns each child manifest with its blobs.
+///
+/// Returns `Ok(None)` when the archive has no `index.json` — an older Docker
+/// without the containerd image store — so callers can fall back.
+pub fn parse_oci_layout(tar_data: &[u8]) -> Result<Option<OciLayout>> {
+    let mut archive = tar::Archive::new(tar_data);
+    let mut files: HashMap<String, Vec<u8>> = HashMap::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_string_lossy().to_string();
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf)?;
+        files.insert(path, buf);
+    }
+
+    let Some(index_bytes) = files.get("index.json") else {
+        return Ok(None);
+    };
+    let top: serde_json::Value = serde_json::from_slice(index_bytes)?;
+
+    // Resolve to the image index: the top-level index holds one descriptor,
+    // which for a `docker save` is itself an index (the manifest list).
+    let blob = |digest: &str, files: &HashMap<String, Vec<u8>>| -> Option<Vec<u8>> {
+        digest
+            .strip_prefix("sha256:")
+            .and_then(|hex| files.get(&format!("blobs/sha256/{hex}")).cloned())
+    };
+
+    let first = top
+        .get("manifests")
+        .and_then(|m| m.as_array())
+        .and_then(|m| m.first())
+        .context("index.json has no manifests")?;
+    let first_digest = first
+        .get("digest")
+        .and_then(|d| d.as_str())
+        .context("index.json descriptor has no digest")?;
+    let first_media = first
+        .get("mediaType")
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+
+    let image_index: serde_json::Value =
+        if first_media.contains("image.index") || first_media.contains("manifest.list") {
+            let bytes = blob(first_digest, &files)
+                .with_context(|| format!("index blob {first_digest} missing from archive"))?;
+            serde_json::from_slice(&bytes)?
+        } else {
+            // Single-manifest layout: synthesize an index over it so callers get
+            // one shape either way.
+            serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [first],
+            })
+        };
+
+    let mut children = Vec::new();
+    for desc in image_index
+        .get("manifests")
+        .and_then(|m| m.as_array())
+        .context("image index has no manifests")?
+    {
+        let digest = desc
+            .get("digest")
+            .and_then(|d| d.as_str())
+            .context("manifest descriptor has no digest")?
+            .to_string();
+        let media_type = desc
+            .get("mediaType")
+            .and_then(|m| m.as_str())
+            .unwrap_or("application/vnd.oci.image.manifest.v1+json")
+            .to_string();
+        let platform = desc
+            .get("platform")
+            .map(|p| {
+                format!(
+                    "{}/{}",
+                    p.get("os").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                    p.get("architecture")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                )
+            })
+            .unwrap_or_else(|| "unknown/unknown".to_string());
+
+        let bytes = blob(&digest, &files)
+            .with_context(|| format!("manifest blob {digest} missing from archive"))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+        // Every blob this manifest references must exist in the registry before
+        // the manifest itself is accepted.
+        let mut blobs = Vec::new();
+        if let Some(cfg) = manifest
+            .get("config")
+            .and_then(|c| c.get("digest"))
+            .and_then(|d| d.as_str())
+            && let Some(data) = blob(cfg, &files)
+        {
+            blobs.push((cfg.to_string(), data));
+        }
+        if let Some(layers) = manifest.get("layers").and_then(|l| l.as_array()) {
+            for l in layers {
+                if let Some(d) = l.get("digest").and_then(|d| d.as_str())
+                    && let Some(data) = blob(d, &files)
+                {
+                    blobs.push((d.to_string(), data));
+                }
+            }
+        }
+
+        children.push(OciChildManifest {
+            digest,
+            media_type,
+            platform,
+            bytes,
+            blobs,
+        });
+    }
+
+    Ok(Some(OciLayout {
+        index: image_index,
+        children,
+    }))
 }
 
 pub fn parse_docker_tar(tar_data: &[u8]) -> Result<DockerTarEntries> {

@@ -2,10 +2,22 @@
 //!
 //! Backs a UI provider/model dropdown. Unlike the OpenAI-compat `/v1/models` egress
 //! endpoint (a flat `{id, provider}` list for agent SDKs) and `/api/model-registry`
-//! (admin tier→model config), this groups the **currently-effective** rows of the
-//! `model_pricing` table by provider and exposes every column that table carries —
-//! prices, currency, notes, and the temporal window. No metadata beyond what the DB
-//! already stores is invented here.
+//! (admin tier→model config), this lists every `(provider, model)` the platform knows
+//! — the union of what each endpoint actually **serves** (`provider_models`, synced
+//! from its `GET /models`) and what carries a **currently-effective price**
+//! (`model_pricing`) — so a served-but-unpriced model (a custom provider with no
+//! Portkey price book) still appears, with null prices and `pricing_available: false`,
+//! and a priced-but-unlisted provider (Gemini, whose `/models` shape the catalog sync
+//! can't speak) is not dropped. No metadata beyond what the DB stores is invented.
+//!
+//! **Custom providers are the exception: for them `provider_models` is authoritative.**
+//! We asked the endpoint what it serves and it answered, so pricing may only annotate
+//! that answer — never extend it. The union would otherwise let a price book invent
+//! models the endpoint has never heard of: registering an Azure resource pulls Portkey's
+//! whole `azure-openai` book (Grok, `text-davinci-001`, every `.ft` variant) into
+//! `model_pricing` under the provider's label, and every one of those names would be
+//! offered for tier routing despite resolving to nothing but a 404 at call time. Azure
+//! routes by *deployment* name, which no price book can know.
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use chrono::{DateTime, Utc};
@@ -24,40 +36,56 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/llm-router/providers", get(list_providers))
 }
 
-/// The raw `model_pricing` shape we read; `Decimal` prices are projected to `f64` for
-/// the response (as [`crate::llm_router::model_registry`]'s neighbours and `DbPricing` do).
+/// The raw joined shape we read; `Decimal` prices are projected to `f64` for the
+/// response (as [`crate::llm_router::model_registry`]'s neighbours and `DbPricing` do).
+/// Every pricing column is optional: a `provider_models` row with no matching price
+/// carries all-null prices.
 #[derive(sqlx::FromRow)]
 struct PricingRow {
     provider: String,
     model: String,
-    input_price_per_1m: Decimal,
-    output_price_per_1m: Decimal,
+    input_price_per_1m: Option<Decimal>,
+    output_price_per_1m: Option<Decimal>,
     cache_creation_price_per_1m: Option<Decimal>,
     cache_read_price_per_1m: Option<Decimal>,
-    currency: String,
+    currency: Option<String>,
     notes: Option<String>,
-    effective_from: DateTime<Utc>,
+    effective_from: Option<DateTime<Utc>>,
     effective_until: Option<DateTime<Utc>>,
+    /// Whether `provider_models` vouches for this row — i.e. the provider's own model
+    /// listing returned it. False ⇒ the row exists only because something priced it.
+    /// The `COALESCE`d `provider`/`model` above cannot tell the two apart.
+    served: bool,
 }
 
-/// One model within a provider group. Field names mirror the `model_pricing` columns.
+/// One model within a provider group. Field names mirror the `model_pricing` columns;
+/// prices are null when the model has no currently-effective price row.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ModelEntry {
     model: String,
-    input_price_per_1m: f64,
-    output_price_per_1m: f64,
+    input_price_per_1m: Option<f64>,
+    output_price_per_1m: Option<f64>,
     cache_creation_price_per_1m: Option<f64>,
     cache_read_price_per_1m: Option<f64>,
-    currency: String,
+    currency: Option<String>,
     notes: Option<String>,
-    effective_from: DateTime<Utc>,
+    effective_from: Option<DateTime<Utc>>,
     effective_until: Option<DateTime<Utc>>,
+    /// Whether a currently-effective price row backs this model. `false` ⇒ the model is
+    /// served but its cost is not tracked (shown as "cost not tracked" in the UI, not $0).
+    pricing_available: bool,
 }
 
 /// A provider and its models, e.g. `{ "provider": "openai", "models": [...] }`.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ProviderCatalog {
     provider: String,
+    /// UUID of the custom provider, if this is a DB-registered custom endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_id: Option<uuid::Uuid>,
+    /// Human-friendly name of the custom provider, if this is a DB-registered custom endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
     models: Vec<ModelEntry>,
 }
 
@@ -85,17 +113,30 @@ pub(crate) async fn list_providers(
     State(state): State<AppState>,
     _claims: Claims,
 ) -> impl IntoResponse {
-    // One row per (provider, model): the latest window that is effective right now.
+    // The union of served models (`provider_models`) and currently-effective priced
+    // models (`model_pricing`). A served model with no price row shows with null
+    // prices; a priced model that isn't in the catalog (e.g. Gemini) still shows.
     let rows = sqlx::query_as::<_, PricingRow>(
-        r#"SELECT DISTINCT ON (provider, model)
-               provider, model,
-               input_price_per_1m, output_price_per_1m,
-               cache_creation_price_per_1m, cache_read_price_per_1m,
-               currency, notes, effective_from, effective_until
-           FROM model_pricing
-           WHERE effective_from <= now()
-             AND (effective_until IS NULL OR effective_until > now())
-           ORDER BY provider, model, effective_from DESC"#,
+        r#"SELECT
+               COALESCE(pm.provider, mp.provider) AS provider,
+               COALESCE(pm.model, mp.model)       AS model,
+               pm.provider IS NOT NULL            AS served,
+               mp.input_price_per_1m, mp.output_price_per_1m,
+               mp.cache_creation_price_per_1m, mp.cache_read_price_per_1m,
+               mp.currency, mp.notes, mp.effective_from, mp.effective_until
+           FROM provider_models pm
+           FULL OUTER JOIN (
+               SELECT DISTINCT ON (provider, model)
+                   provider, model,
+                   input_price_per_1m, output_price_per_1m,
+                   cache_creation_price_per_1m, cache_read_price_per_1m,
+                   currency, notes, effective_from, effective_until
+               FROM model_pricing
+               WHERE effective_from <= now()
+                 AND (effective_until IS NULL OR effective_until > now())
+               ORDER BY provider, model, effective_from DESC
+           ) mp ON pm.provider = mp.provider AND pm.model = mp.model
+           ORDER BY provider, model"#,
     )
     .fetch_all(&state.db)
     .await;
@@ -108,8 +149,28 @@ pub(crate) async fn list_providers(
         }
     };
 
+    // Registered custom providers are never hidden, even if their label collides with
+    // a `HIDDEN_PROVIDERS` entry (e.g. an admin registers "deepseek").
+    let custom_meta: std::collections::HashMap<String, (uuid::Uuid, String)> =
+        match sqlx::query_as::<_, (uuid::Uuid, String, String)>(
+            "SELECT id, label, display_name FROM custom_providers WHERE deleted_at IS NULL",
+        )
+        .fetch_all(&state.db)
+        .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|(id, label, name)| (label, (id, name)))
+                .collect(),
+            Err(e) => {
+                tracing::error!(%e, "list_providers: custom provider lookup failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+            }
+        };
+    let custom_labels: std::collections::HashSet<String> = custom_meta.keys().cloned().collect();
+
     ApiResponse::ok(
-        json!(group_by_provider(rows)),
+        json!(group_by_provider(rows, &custom_labels, &custom_meta)),
         "Providers retrieved successfully",
     )
     .into_response()
@@ -125,20 +186,36 @@ fn normalize_provider(name: &str) -> &str {
     }
 }
 
-/// Providers hidden from the catalog until their router integration is ready.
-const HIDDEN_PROVIDERS: &[&str] = &["groq", "deepseek"];
+/// Providers hidden from the catalog until their router integration is ready. A
+/// registered custom provider under one of these labels is exempt (see `custom_labels`).
+const HIDDEN_PROVIDERS: &[&str] = &["groq", "deepseek", "amazon-bedrock"];
 
-fn group_by_provider(rows: Vec<PricingRow>) -> Vec<ProviderCatalog> {
+fn group_by_provider(
+    rows: Vec<PricingRow>,
+    custom_labels: &std::collections::HashSet<String>,
+    custom_meta: &std::collections::HashMap<String, (uuid::Uuid, String)>,
+) -> Vec<ProviderCatalog> {
     let mut out: Vec<ProviderCatalog> = Vec::new();
     for row in rows {
         let provider = normalize_provider(&row.provider).to_owned();
-        if HIDDEN_PROVIDERS.contains(&provider.as_str()) {
+        // Hide built-in-but-unready providers, but never a registered custom provider.
+        if HIDDEN_PROVIDERS.contains(&provider.as_str()) && !custom_labels.contains(&provider) {
             continue;
         }
+        // A custom provider's own listing is the whole truth (see the module doc): drop a
+        // model only a price book claims. Built-ins keep the union — that is what carries
+        // Gemini, which is priced but whose listing shape the catalog sync cannot read.
+        if custom_labels.contains(&provider) && !row.served {
+            continue;
+        }
+        let input = row.input_price_per_1m.and_then(|d| d.to_f64());
+        let output = row.output_price_per_1m.and_then(|d| d.to_f64());
         let entry = ModelEntry {
             model: row.model,
-            input_price_per_1m: row.input_price_per_1m.to_f64().unwrap_or(0.0),
-            output_price_per_1m: row.output_price_per_1m.to_f64().unwrap_or(0.0),
+            // A price row provides both input and output; treat either present as priced.
+            pricing_available: input.is_some() || output.is_some(),
+            input_price_per_1m: input,
+            output_price_per_1m: output,
             cache_creation_price_per_1m: row.cache_creation_price_per_1m.and_then(|d| d.to_f64()),
             cache_read_price_per_1m: row.cache_read_price_per_1m.and_then(|d| d.to_f64()),
             currency: row.currency,
@@ -149,11 +226,139 @@ fn group_by_provider(rows: Vec<PricingRow>) -> Vec<ProviderCatalog> {
         if let Some(group) = out.iter_mut().find(|g| g.provider == provider) {
             group.models.push(entry);
         } else {
+            let (provider_id, display_name) = custom_meta
+                .get(&provider)
+                .map(|(id, name)| (Some(*id), Some(name.clone())))
+                .unwrap_or((None, None));
             out.push(ProviderCatalog {
                 provider,
+                provider_id,
+                display_name,
                 models: vec![entry],
             });
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    /// A priced row: it carries a price, so `pricing_available` is true.
+    fn priced(provider: &str, model: &str, served: bool) -> PricingRow {
+        PricingRow {
+            provider: provider.into(),
+            model: model.into(),
+            served,
+            input_price_per_1m: Some(Decimal::new(1, 0)),
+            output_price_per_1m: Some(Decimal::new(2, 0)),
+            cache_creation_price_per_1m: None,
+            cache_read_price_per_1m: None,
+            currency: Some("USD".into()),
+            notes: None,
+            effective_from: None,
+            effective_until: None,
+        }
+    }
+
+    /// A row the provider listed but nothing prices — the `FULL OUTER JOIN`'s left-only side.
+    fn unpriced(provider: &str, model: &str) -> PricingRow {
+        PricingRow {
+            input_price_per_1m: None,
+            output_price_per_1m: None,
+            ..priced(provider, model, true)
+        }
+    }
+
+    fn custom(labels: &[&str]) -> (HashSet<String>, HashMap<String, (uuid::Uuid, String)>) {
+        let set: HashSet<String> = labels.iter().map(|s| (*s).to_string()).collect();
+        let meta = labels
+            .iter()
+            .map(|l| {
+                (
+                    (*l).to_string(),
+                    (uuid::Uuid::nil(), format!("{l} display")),
+                )
+            })
+            .collect();
+        (set, meta)
+    }
+
+    fn models_of(groups: &[ProviderCatalog], provider: &str) -> Vec<String> {
+        groups
+            .iter()
+            .find(|g| g.provider == provider)
+            .map(|g| g.models.iter().map(|m| m.model.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The bug this guard exists for: registering an Azure resource pulls Portkey's whole
+    /// `azure-openai` price book in under the provider's label, and every one of those
+    /// names used to be offered for tier routing. Only the deployment the endpoint
+    /// actually listed may survive.
+    #[test]
+    fn custom_provider_keeps_only_what_it_serves() {
+        let (labels, meta) = custom(&["azure"]);
+        let rows = vec![
+            unpriced("azure", "gpt4o"),       // the one real deployment
+            priced("azure", "grok-3", false), // price book only
+            priced("azure", "text-davinci-001", false),
+        ];
+        assert_eq!(
+            models_of(&group_by_provider(rows, &labels, &meta), "azure"),
+            vec!["gpt4o"]
+        );
+    }
+
+    /// Built-ins keep the union: Gemini is priced but its listing shape the catalog sync
+    /// cannot read, so a price-only row is the only evidence it exists.
+    #[test]
+    fn builtin_provider_keeps_priced_but_unlisted_models() {
+        let (labels, meta) = custom(&["azure"]);
+        let rows = vec![priced("gemini", "gemini-2.0-flash", false)];
+        assert_eq!(
+            models_of(&group_by_provider(rows, &labels, &meta), "gemini"),
+            vec!["gemini-2.0-flash"]
+        );
+    }
+
+    /// A custom provider's served model stays even when nothing prices it — the common
+    /// case for Azure, whose deployment nicknames no price book can match.
+    #[test]
+    fn custom_provider_keeps_served_but_unpriced_model() {
+        let (labels, meta) = custom(&["bdrock"]);
+        let groups = group_by_provider(vec![unpriced("bdrock", "claude-sonnet-4")], &labels, &meta);
+        let entry = &groups
+            .iter()
+            .find(|g| g.provider == "bdrock")
+            .unwrap()
+            .models[0];
+        assert_eq!(entry.model, "claude-sonnet-4");
+        assert!(!entry.pricing_available);
+    }
+
+    /// A custom provider under a hidden built-in's label keeps its exemption, and the new
+    /// guard still applies to it.
+    #[test]
+    fn custom_provider_under_hidden_label_is_exempt_but_still_filtered() {
+        let (labels, meta) = custom(&["deepseek"]);
+        let rows = vec![
+            unpriced("deepseek", "deepseek-chat"),
+            priced("deepseek", "deepseek-phantom", false),
+        ];
+        assert_eq!(
+            models_of(&group_by_provider(rows, &labels, &meta), "deepseek"),
+            vec!["deepseek-chat"]
+        );
+    }
+
+    /// A hidden built-in with no custom provider registered under its label stays hidden.
+    #[test]
+    fn hidden_builtin_without_custom_registration_is_dropped() {
+        let (labels, meta) = custom(&[]);
+        let groups = group_by_provider(vec![priced("groq", "llama-3", false)], &labels, &meta);
+        assert!(groups.is_empty());
+    }
 }

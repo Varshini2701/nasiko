@@ -146,6 +146,8 @@ pub async fn seed_agents_if_configured(state: &AppState) {
             Some(owner_id),
         )
         .await;
+        // Per-agent MCP gateway credential (rotates on every re-seed).
+        crate::mcp::wiring::inject_agent_gateway_token(&state.db, &mut env, agent.id).await;
 
         // UUID-keyed (see agents::build_agent_spec) so a re-seed re-targets the same
         // workload rather than leaving a name-keyed orphan.
@@ -162,6 +164,12 @@ pub async fn seed_agents_if_configured(state: &AppState) {
             None,
             owner_id,
         );
+        // Only takes effect when `deploy()` actually recreates the container
+        // (no existing container, or its image/env changed) — the idempotent
+        // "already running, same image, same env" branch never consults this
+        // flag at all, so SEED_FORCE_PULL alone does not force a re-pull of an
+        // unchanged, already-running seed agent. See DeploymentSpec::force_pull.
+        spec.force_pull = force_pull;
         crate::agents::attach_pull_credential(
             &state.db,
             &state.config.agent_runtime,
@@ -218,13 +226,204 @@ pub async fn seed_agents_if_configured(state: &AppState) {
     }
 }
 
+/// One internal agent to deploy.
+///
+/// An internal agent is a platform-owned agent excluded from every agent
+/// list, routing candidate and A2A discovery query (`is_internal = true`, see
+/// `migrations/0014_agent_internal_flag.sql`), reachable only through whatever
+/// dedicated route its owner mounts rather than the generic
+/// explicit-`agent_id` A2A dispatch path.
+///
+/// The caller owns the policy — which image, under what name, and what the
+/// container needs in its environment. This module owns the mechanics, which
+/// are the ones `seed_agents_if_configured` already uses for ordinary agents.
+/// The split is deliberate: an edition that ships such an agent describes it
+/// in its own tree, and this one carries no particular agent's vocabulary.
+pub struct InternalAgentSeed {
+    /// Agent row name, and the name the deployment is tracked under.
+    pub name: String,
+    /// Container image reference.
+    pub image: String,
+    /// Redeploy even when the image reference has not changed — for reusing
+    /// one tag across builds instead of bumping it, the single-agent
+    /// equivalent of `SEED_FORCE_PULL`.
+    pub force_pull: bool,
+    /// Container environment, on top of the two this function sets itself:
+    /// `PORT`, and the per-agent MCP gateway credential.
+    pub env: HashMap<String, String>,
+}
+
+/// Deploys one internal agent the same way `seed_agents_if_configured` deploys
+/// any other, except the row carries `is_internal = true`.
+///
+/// Designed to run as a background task — does not block server startup, and
+/// returns quietly when the agent is already running on the same image.
+pub async fn seed_internal_agent(state: &AppState, seed: InternalAgentSeed) {
+    let InternalAgentSeed {
+        name: agent_name,
+        image,
+        force_pull,
+        env: extra_env,
+    } = seed;
+
+    let owner_id: Uuid = match sqlx::query_scalar(
+        "SELECT id FROM users WHERE is_superuser = true AND deleted_at IS NULL ORDER BY created_at LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(Some(id)) => id,
+        _ => {
+            warn!(agent = %agent_name, "no admin user found, cannot seed internal agent (run bootstrap first)");
+            return;
+        }
+    };
+
+    let existing = sqlx::query_as::<_, Agent>("SELECT * FROM agents WHERE name = $1")
+        .bind(&agent_name)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+
+    let needs_deploy = match &existing {
+        None => true,
+        Some(agent) => {
+            let image_changed = agent.image.as_deref() != Some(image.as_str());
+            if image_changed || force_pull {
+                true
+            } else {
+                let container_id = ContainerId::from_uuid(agent.id);
+                match state.runtime.status(&container_id).await {
+                    Ok(status) => status.state != RuntimeState::Running,
+                    Err(_) => true,
+                }
+            }
+        }
+    };
+    if !needs_deploy {
+        info!(agent = %agent_name, "internal agent already running, skipping");
+        return;
+    }
+
+    info!(agent = %agent_name, %image, "seeding internal agent");
+
+    let agent = match &existing {
+        Some(a) => {
+            let _ = sqlx::query(
+                "UPDATE agents SET image = $2, status = 'deploying', updated_at = now() WHERE id = $1",
+            )
+            .bind(a.id)
+            .bind(&image)
+            .execute(&state.db)
+            .await;
+            a.clone()
+        }
+        None => {
+            let inserted = sqlx::query_as::<_, Agent>(
+                r#"INSERT INTO agents (name, owner_id, image, status, is_public, is_internal, metadata)
+                   VALUES ($1, $2, $3, 'deploying', false, true, '{"seed": true}')
+                   RETURNING *"#,
+            )
+            .bind(&agent_name)
+            .bind(owner_id)
+            .bind(&image)
+            .fetch_one(&state.db)
+            .await;
+            match inserted {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(agent = %agent_name, error = %e, "failed to register internal agent");
+                    return;
+                }
+            }
+        }
+    };
+
+    let mut env = HashMap::new();
+    env.insert("PORT".into(), AGENT_PORT.to_string());
+    env.extend(extra_env);
+    // Per-agent MCP gateway credential (rotates on every re-seed) — without
+    // this, McpInjector still sets MCP_GATEWAY_URL unconditionally but has no
+    // MCP_GATEWAY_TOKEN to complete MCP_GATEWAY_CONNECT_URL with, leaving the
+    // gateway unreachable from inside the container.
+    crate::mcp::wiring::inject_agent_gateway_token(&state.db, &mut env, agent.id).await;
+
+    let mut spec = crate::agents::build_agent_spec(
+        agent.id,
+        &agent_name,
+        image.clone(),
+        vec![AGENT_PORT],
+        env,
+        &state.config.agent_default_memory,
+        state.config.agent_max_replicas,
+        false,
+        None,
+        owner_id,
+    );
+    // Only takes effect when `deploy()` actually recreates the container (no
+    // existing container, or its image/env changed) — see this function's
+    // sibling `seed_agents_if_configured` for the same caveat in full, and
+    // DeploymentSpec::force_pull.
+    spec.force_pull = force_pull;
+    crate::agents::attach_pull_credential(
+        &state.db,
+        &state.config.agent_runtime,
+        &state.config.agent_image_registry,
+        &mut spec,
+        agent.id,
+    )
+    .await;
+
+    match state.runtime.deploy(&spec).await {
+        Ok(status) => {
+            info!(agent = %agent_name, ?status, "internal agent deployed");
+            let agent_url =
+                crate::agents::resolve_agent_url(&state.runtime, &status, &spec.container_id).await;
+            let _ = sqlx::query(
+                "UPDATE agents SET status = 'running', url = $2, transport_path = '/jsonrpc', updated_at = now() WHERE id = $1",
+            )
+            .bind(agent.id)
+            .bind(&agent_url)
+            .execute(&state.db)
+            .await;
+            crate::agents::utils::ensure_deployment_tracked(
+                &state.db,
+                agent.id,
+                Some(owner_id),
+                &image,
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!(agent = %agent_name, error = %e, "failed to deploy internal agent");
+            let _ = sqlx::query(
+                "UPDATE agents SET status = 'failed', updated_at = now() WHERE id = $1",
+            )
+            .bind(agent.id)
+            .execute(&state.db)
+            .await;
+        }
+    }
+}
+
 /// Extract agent name from image ref: "nasiko/echo-agent:v1" -> "echo-agent"
+/// Extract agent name from image ref: "nasiko/echo-agent:v1" -> "echo-agent",
+/// "localhost:5050/echo-agent:v1" -> "echo-agent".
+///
+/// Splits on `/` FIRST, not `:` first — a registry host commonly carries its
+/// own port (`localhost:5050/...`, `myregistry.example.com:5000/...`), and
+/// splitting on the first `:` would wrongly treat that port as the tag
+/// separator, extracting the registry host itself as the "name" (confirmed
+/// live: `localhost:5050/weave-build-orchestrator:v1` produced an agent
+/// literally named "localhost"). The tag, if any, only ever appears after
+/// the LAST `/`, so isolating that final path segment before splitting on
+/// `:` is unambiguous regardless of how many colons a registry host has.
 fn extract_name(image: &str) -> String {
-    let without_tag = image.split(':').next().unwrap_or(image);
-    without_tag
-        .rsplit('/')
+    let last_segment = image.rsplit('/').next().unwrap_or(image);
+    last_segment
+        .split(':')
         .next()
-        .unwrap_or(without_tag)
+        .unwrap_or(last_segment)
         .to_string()
 }
 
@@ -377,38 +576,40 @@ pub async fn seed_toolkits_if_configured(state: &AppState) {
         }
     }
 
-    // Phase 2: bulk-sync tools for newly seeded toolkits in a single pass
-    // through the Composio catalog (~48 pages, not 48 × N).
+    // Phase 2: sync tools per-toolkit using the v3.1 API (server-side filtered).
+    // The previous bulk scan (v3 `/api/v3/tools`) hit a 50-page safety cap and
+    // missed tools — e.g. gmail has 63 tools but only 23 were synced.  The v3.1
+    // per-toolkit endpoint returns only that toolkit's tools, no cap risk.
     if newly_seeded.is_empty() {
         return;
     }
     let Some(provider) = &state.mcp.providers.composio else {
         return;
     };
-    // Downcast to ComposioProvider to access the bulk method.
-    let composio = provider
-        .as_any()
-        .downcast_ref::<nasiko_mcp_gateway::provider::ComposioProvider>();
-    let Some(composio) = composio else {
-        warn!("composio provider is not ComposioProvider, skipping bulk tool sync");
-        return;
-    };
-    let toolkit_names: Vec<String> = newly_seeded.keys().cloned().collect();
     info!(
-        count = toolkit_names.len(),
-        "bulk-syncing tools for newly seeded toolkits"
+        count = newly_seeded.len(),
+        "syncing tools for newly seeded toolkits (per-toolkit v3.1 API)"
     );
-    let tools_by_toolkit = composio.list_tools_for_toolkits(&toolkit_names).await;
-    for (toolkit, tools) in &tools_by_toolkit {
-        let Some(cid) = newly_seeded.get(toolkit) else {
-            continue;
+    for (toolkit, cid) in &newly_seeded {
+        let tools = match provider.list_toolkit_tools(toolkit).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(toolkit = %toolkit, %e, "failed to fetch tools for toolkit");
+                continue;
+            }
         };
         if tools.is_empty() {
             continue;
         }
-        let parsed: Vec<(String, Option<String>)> = tools
+        let parsed: Vec<(String, Option<String>, Option<serde_json::Value>)> = tools
             .iter()
-            .map(|t| (t.name.clone(), t.description.clone()))
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    t.description.clone(),
+                    t.input_schema.clone(),
+                )
+            })
             .collect();
         match nasiko_mcp_gateway::repo::upsert_connector_tools(&state.db, *cid, &parsed).await {
             Ok(()) => {
@@ -421,5 +622,84 @@ pub async fn seed_toolkits_if_configured(state: &AppState) {
             }
             Err(e) => warn!(toolkit = %toolkit, %e, "failed to sync tools"),
         }
+    }
+
+    // Phase 3: backfill tools for any existing Composio connector whose
+    // mcp_connector_tools is empty — handles restarts after a failed sync or
+    // cleared table.  Newly seeded connectors were already handled above.
+    match nasiko_mcp_gateway::repo::list_composio_connectors(&state.db).await {
+        Ok(all_composio) => {
+            for conn in all_composio {
+                if newly_seeded.values().any(|id| *id == conn.id) {
+                    continue; // already synced above
+                }
+                let tools =
+                    nasiko_mcp_gateway::repo::list_connector_tools(&state.db, conn.id).await;
+                if matches!(&tools, Ok(t) if t.is_empty()) {
+                    info!(connector = %conn.name, "backfilling empty tool catalog");
+                    if let Some(owner) = conn.owner_id
+                        && let Err(e) = nasiko_mcp_gateway::permissions::sync_connector_tools_by_id(
+                            &state.mcp, owner, conn.id,
+                        )
+                        .await
+                    {
+                        warn!(connector = %conn.name, %e, "backfill sync failed");
+                    }
+                }
+            }
+        }
+        Err(e) => warn!(%e, "failed to list composio connectors for backfill"),
+    }
+
+    // Rebuild the search index once after all tool syncs are done.
+    if let Err(e) = state.mcp.search_index.rebuild(&state.db).await {
+        warn!(%e, "search index rebuild after seed failed");
+    }
+}
+
+#[cfg(test)]
+mod extract_name_tests {
+    use super::extract_name;
+
+    #[test]
+    fn plain_dockerhub_style_ref() {
+        assert_eq!(extract_name("nasiko/echo-agent:v1"), "echo-agent");
+    }
+
+    #[test]
+    fn no_tag_at_all() {
+        assert_eq!(extract_name("nasiko/echo-agent"), "echo-agent");
+    }
+
+    #[test]
+    fn bare_name_no_namespace_no_tag() {
+        assert_eq!(extract_name("echo-agent"), "echo-agent");
+    }
+
+    #[test]
+    fn registry_host_with_a_port_is_not_mistaken_for_the_tag_separator() {
+        // Regression: a naive "split on first colon" treats the registry
+        // port as the tag delimiter, extracting "localhost" as the name
+        // instead of the actual repository — confirmed live before this fix.
+        assert_eq!(
+            extract_name("localhost:5050/weave-build-orchestrator:v1"),
+            "weave-build-orchestrator"
+        );
+    }
+
+    #[test]
+    fn registry_host_with_a_port_and_no_tag() {
+        assert_eq!(
+            extract_name("localhost:5050/weave-build-orchestrator"),
+            "weave-build-orchestrator"
+        );
+    }
+
+    #[test]
+    fn multi_level_registry_path() {
+        assert_eq!(
+            extract_name("myregistry.example.com:5000/team/project/agent:v3"),
+            "agent"
+        );
     }
 }

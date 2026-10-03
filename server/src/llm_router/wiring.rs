@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Inject LLM gateway wiring into `env_vars` for `agent_id`, choosing the env-var set by
@@ -19,8 +18,13 @@ use uuid::Uuid;
 /// Best-effort: a configuration failure is logged and the deploy proceeds. Deploy is
 /// authoritative — when the gateway is configured, the injected `*_BASE_URL`/`*_API_KEY`
 /// overwrite any pre-existing values.
+///
+/// Generic over the executor (not concretely `&PgPool`) so a caller whose agent row was
+/// inserted earlier in an as-yet-uncommitted transaction can pass `&mut *tx` — otherwise
+/// `fetch_inbound_format` can't see that row via a separate pool connection and silently
+/// falls back to the default `inbound_format`, wiring the wrong SDK env vars.
 pub async fn inject_agent_llm_env(
-    db: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     env_vars: &mut HashMap<String, String>,
     agent_id: Uuid,
     owner_id: Option<Uuid>,
@@ -42,7 +46,10 @@ pub async fn inject_agent_llm_env(
 
 /// Read `agents.inbound_format`; missing row / unknown value / query error → OpenAI
 /// (the backward-compatible default).
-async fn fetch_inbound_format(db: &PgPool, agent_id: Uuid) -> nasiko_llm_router::InboundFormat {
+async fn fetch_inbound_format(
+    db: impl sqlx::PgExecutor<'_>,
+    agent_id: Uuid,
+) -> nasiko_llm_router::InboundFormat {
     let raw: Option<String> = sqlx::query_scalar("SELECT inbound_format FROM agents WHERE id = $1")
         .bind(agent_id)
         .fetch_optional(db)

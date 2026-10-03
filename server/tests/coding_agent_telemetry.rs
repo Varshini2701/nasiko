@@ -2,10 +2,10 @@ mod common;
 
 use chrono::{TimeZone, Utc};
 use nasiko_types::{
-    CODING_AGENT_EVENT_VERSION, CapturePolicy, CodingAgentEventV1, CodingAgentLlmCall,
-    CodingAgentSession, CodingAgentSource, CodingAgentTimestampQuality, CodingAgentToolAssociation,
-    CodingAgentToolCall, CodingAgentToolCallStatus, CodingAgentTurn, coding_agent_event_id,
-    coding_agent_session_id,
+    CODING_AGENT_EVENT_VERSION, CODING_AGENT_SESSION_TITLE_MAX_BYTES, CapturePolicy,
+    CodingAgentEventV1, CodingAgentLlmCall, CodingAgentSession, CodingAgentSource,
+    CodingAgentTimestampQuality, CodingAgentToolAssociation, CodingAgentToolCall,
+    CodingAgentToolCallStatus, CodingAgentTurn, coding_agent_event_id, coding_agent_session_id,
 };
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -48,6 +48,7 @@ fn event(session: &str, turn: &str, policy: CapturePolicy) -> CodingAgentEventV1
         session: CodingAgentSession {
             id: coding_agent_session_id("claude", session),
             source_id: session.into(),
+            title: None,
         },
         turn: CodingAgentTurn {
             id: turn.into(),
@@ -63,6 +64,7 @@ fn event(session: &str, turn: &str, policy: CapturePolicy) -> CodingAgentEventV1
                 output_tokens: 5,
                 cache_read_tokens: 2,
                 cache_creation_tokens: 3,
+                accounting: None,
                 started_at,
                 ended_at,
             }],
@@ -87,6 +89,208 @@ async fn post(server: &common::TestServer, user_id: Uuid, events: &[CodingAgentE
     .json()
     .await
     .unwrap()
+}
+
+/// Exercise the real exporter without exposing its internal payload builder.
+async fn exported_trace(server: &common::TestServer) -> Value {
+    use std::sync::{Arc, Mutex};
+    let captured = Arc::new(Mutex::new(None::<Value>));
+    let capture = captured.clone();
+    let mut collector = mockito::Server::new_async().await;
+    let traces = collector
+        .mock("POST", "/v1/traces")
+        .match_request(move |request| {
+            *capture.lock().unwrap() =
+                Some(serde_json::from_slice(request.body().unwrap()).unwrap());
+            true
+        })
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+    let logs = collector
+        .mock("POST", "/v1/logs")
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+    nasiko_server::coding_agent_otlp::export_once(&server.db, &server.client, &collector.url())
+        .await
+        .unwrap();
+    traces.assert_async().await;
+    logs.assert_async().await;
+    let mut payload = captured.lock().unwrap().clone().unwrap();
+    // Tempo returns enum names rather than the collector's numeric input.
+    for span in payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array_mut()
+        .unwrap()
+    {
+        span["kind"] = if span["kind"] == 3 {
+            "SPAN_KIND_CLIENT"
+        } else {
+            "SPAN_KIND_INTERNAL"
+        }
+        .into();
+    }
+    payload
+}
+
+#[tokio::test]
+#[serial]
+async fn late_receipt_retries_incomplete_trace_and_materializes_once() {
+    use nasiko_server::observability::{
+        receipt_materializer::materialize_once, session_resolver::PgSessionIdResolver,
+    };
+    let server = common::TestServer::start().await;
+    let (user, _) = setup(&server).await;
+    let mut source = event("late-receipt", "turn", CapturePolicy::Content);
+    source.turn.llm_calls[0].provider = "unknown".into();
+    post(&server, user, std::slice::from_ref(&source)).await;
+    // Receipt time is new, but its trace predates the rolling search window.
+    sqlx::query("UPDATE trace_usage_cursor SET high_water=now() WHERE id=1")
+        .execute(&server.db)
+        .await
+        .unwrap();
+    // Materialization state lives on the receipt row; neither repair-era table ships.
+    for table in [
+        "coding_accounting_revisions",
+        "coding_receipt_materializations",
+    ] {
+        let present: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(table)
+            .fetch_one(&server.db)
+            .await
+            .unwrap();
+        assert!(present.is_none(), "{table} should not exist");
+    }
+    let retired: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_trigger WHERE tgname='trigger_calculate_usage_cost'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .unwrap();
+    assert_eq!(retired, 0);
+    let payload = exported_trace(&server).await;
+    let trace_id = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["traceId"]
+        .as_str()
+        .unwrap();
+    let mut tempo = mockito::Server::new_async().await;
+    let provider = nasiko_observability::TempoLokiProvider::new(
+        tempo.url(),
+        tempo.url(),
+        std::sync::Arc::new(nasiko_pricing::PricingEngine::offline()),
+    );
+    let sessions = PgSessionIdResolver::new(server.db.clone());
+    let mut incomplete = payload["resourceSpans"].clone();
+    incomplete[0]["scopeSpans"][0]["spans"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    let partial = tempo
+        .mock("GET", format!("/api/traces/{trace_id}").as_str())
+        .with_status(200)
+        .with_body(json!({"batches":incomplete}).to_string())
+        .create_async()
+        .await;
+    assert_eq!(
+        materialize_once(&server.db, &provider, &sessions)
+            .await
+            .unwrap(),
+        0
+    );
+    let state: (bool, bool) = sqlx::query_as("SELECT materialized_at IS NULL,materialize_last_error IS NOT NULL FROM coding_agent_telemetry_events WHERE user_id=$1 AND event_id=$2")
+        .bind(user).bind(&source.event_id).fetch_one(&server.db).await.unwrap();
+    assert_eq!(state, (true, true));
+    partial.remove_async().await;
+    sqlx::query("UPDATE coding_agent_telemetry_events SET materialize_next_attempt_at=now() WHERE user_id=$1 AND event_id=$2")
+        .bind(user).bind(&source.event_id).execute(&server.db).await.unwrap();
+    let complete = tempo
+        .mock("GET", format!("/api/traces/{trace_id}").as_str())
+        .with_status(200)
+        .with_body(json!({"batches":payload["resourceSpans"]}).to_string())
+        .expect(2)
+        .create_async()
+        .await;
+    assert_eq!(
+        materialize_once(&server.db, &provider, &sessions)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        materialize_once(&server.db, &provider, &sessions)
+            .await
+            .unwrap(),
+        0
+    );
+    complete.assert_async().await;
+    let usage: (i64,i64,i64,i64,bool) = sqlx::query_as("SELECT input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,cost_estimated FROM trace_usage WHERE trace_id=$1")
+        .bind(trace_id).fetch_one(&server.db).await.unwrap();
+    assert_eq!(usage, (10, 5, 2, 3, true));
+    let dashboard: Value = common::as_member(server.client.get(server.url("/api/observability/finops/dashboard?start_time=2023-01-01T00%3A00%3A00Z&end_time=2024-01-01T00%3A00%3A00Z")), &user.to_string(), "admin")
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(dashboard["data"]["token_usage"]["total_tokens"], 20);
+    assert_eq!(dashboard["data"]["token_usage"]["cache_read_tokens"], 2);
+    assert_eq!(dashboard["data"]["token_usage"]["cache_creation_tokens"], 3);
+    assert_eq!(
+        dashboard["data"]["summary"]["estimated_cost"],
+        dashboard["data"]["summary"]["total_cost"]
+    );
+    assert_eq!(dashboard["data"]["summary"]["unknown_confidence_calls"], 0);
+    let state: (bool,bool) = sqlx::query_as("SELECT materialized_at IS NOT NULL,materialize_last_error IS NULL FROM coding_agent_telemetry_events WHERE user_id=$1 AND event_id=$2")
+        .bind(user).bind(&source.event_id).fetch_one(&server.db).await.unwrap();
+    assert_eq!(state, (true, true));
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn tokenless_receipt_completes_without_fabricated_usage() {
+    use nasiko_server::observability::{
+        receipt_materializer::materialize_once, session_resolver::PgSessionIdResolver,
+    };
+    let server = common::TestServer::start().await;
+    let (user, _) = setup(&server).await;
+    let mut source = event("tokenless-receipt", "turn", CapturePolicy::Content);
+    source.turn.llm_calls.clear();
+    post(&server, user, std::slice::from_ref(&source)).await;
+    let payload = exported_trace(&server).await;
+    let trace_id = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["traceId"]
+        .as_str()
+        .unwrap();
+    let mut tempo = mockito::Server::new_async().await;
+    let complete = tempo
+        .mock("GET", format!("/api/traces/{trace_id}").as_str())
+        .with_status(200)
+        .with_body(json!({"batches":payload["resourceSpans"]}).to_string())
+        .expect(2)
+        .create_async()
+        .await;
+    let provider = nasiko_observability::TempoLokiProvider::new(
+        tempo.url(),
+        tempo.url(),
+        std::sync::Arc::new(nasiko_pricing::PricingEngine::offline()),
+    );
+    let sessions = PgSessionIdResolver::new(server.db.clone());
+    assert_eq!(
+        materialize_once(&server.db, &provider, &sessions)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        materialize_once(&server.db, &provider, &sessions)
+            .await
+            .unwrap(),
+        0
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM trace_usage")
+        .fetch_one(&server.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    complete.assert_async().await;
+    server.cleanup().await;
 }
 
 #[tokio::test]
@@ -169,6 +373,18 @@ async fn accepts_content_and_metadata_and_handles_replays_independently() {
         "native-tool"
     );
 
+    let usage: (i32, i32, i32, i32, Option<rust_decimal::Decimal>, Option<bool>) = sqlx::query_as(
+        "SELECT input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, usage_estimated \
+         FROM chat_messages WHERE session_id = $1 AND role = 'assistant'",
+    )
+    .bind(&content_session_id)
+    .fetch_one(&server.db)
+    .await
+    .unwrap();
+    assert_eq!((usage.0, usage.1, usage.2, usage.3), (10, 5, 2, 3));
+    assert!(usage.4.unwrap() > rust_decimal::Decimal::ZERO);
+    assert_eq!(usage.5, Some(true));
+
     let replay = post(&server, user_id, std::slice::from_ref(&content)).await;
     assert_eq!(replay["data"]["results"][0]["status"], "duplicate");
     let mut changed = content.clone();
@@ -203,6 +419,221 @@ async fn accepts_content_and_metadata_and_handles_replays_independently() {
     .await
     .unwrap();
     assert_eq!(stored_agent, agent_id);
+    server.cleanup().await;
+}
+
+async fn session_title(server: &common::TestServer, agent_id: Uuid) -> String {
+    sqlx::query_scalar("SELECT title FROM chat_sessions WHERE agent_id = $1")
+        .bind(agent_id)
+        .fetch_one(&server.db)
+        .await
+        .expect("session exists")
+}
+
+#[tokio::test]
+#[serial]
+async fn inserts_exact_external_title_and_preserves_it_on_later_turns() {
+    let server = common::TestServer::start().await;
+    let (user_id, agent_id) = setup(&server).await;
+    let title = format!(
+        "  {}  ",
+        "é".repeat((CODING_AGENT_SESSION_TITLE_MAX_BYTES - 4) / 2)
+    );
+    let mut first = event("titled", "turn-1", CapturePolicy::Content);
+    first.session.title = Some(title.clone());
+    assert_eq!(
+        post(&server, user_id, &[first]).await["data"]["results"][0]["status"],
+        "accepted"
+    );
+    assert_eq!(session_title(&server, agent_id).await, title);
+
+    let mut later = event("titled", "turn-2", CapturePolicy::Content);
+    later.session.title = Some("Replacement title".into());
+    let missing = event("titled", "turn-3", CapturePolicy::Content);
+    let result = post(&server, user_id, &[later, missing]).await;
+    assert_eq!(result["data"]["results"][0]["status"], "accepted");
+    assert_eq!(result["data"]["results"][1]["status"], "accepted");
+    assert_eq!(session_title(&server, agent_id).await, title);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn upgrades_only_the_coding_session_placeholder_on_a_new_event() {
+    let server = common::TestServer::start().await;
+    let (user_id, agent_id) = setup(&server).await;
+    let metadata = event("placeholder", "turn-1", CapturePolicy::MetadataOnly);
+    let missing = event("placeholder", "turn-2", CapturePolicy::Content);
+    let result = post(&server, user_id, &[metadata, missing]).await;
+    assert_eq!(result["data"]["results"][0]["status"], "accepted");
+    assert_eq!(result["data"]["results"][1]["status"], "accepted");
+    assert_eq!(session_title(&server, agent_id).await, "Coding session");
+
+    let mut titled = event("placeholder", "turn-3", CapturePolicy::Content);
+    titled.session.title = Some("Native title".into());
+    assert_eq!(
+        post(&server, user_id, &[titled]).await["data"]["results"][0]["status"],
+        "accepted"
+    );
+    assert_eq!(session_title(&server, agent_id).await, "Native title");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn title_replays_cannot_rename_a_session() {
+    let server = common::TestServer::start().await;
+    let (user_id, agent_id) = setup(&server).await;
+    let original = event("replay-title", "turn-1", CapturePolicy::Content);
+    assert_eq!(
+        post(&server, user_id, std::slice::from_ref(&original)).await["data"]["results"][0]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        post(&server, user_id, std::slice::from_ref(&original)).await["data"]["results"][0]["status"],
+        "duplicate"
+    );
+
+    let mut changed = original;
+    changed.session.title = Some("Replay must not upgrade".into());
+    let rejected = post(&server, user_id, &[changed]).await;
+    assert_eq!(rejected["data"]["results"][0]["status"], "rejected");
+    assert_eq!(
+        rejected["data"]["results"][0]["error"],
+        "event_id already exists with a different payload"
+    );
+    assert_eq!(session_title(&server, agent_id).await, "Coding session");
+
+    let mut titled = event("replay-title", "turn-2", CapturePolicy::Content);
+    titled.session.title = Some("Accepted title".into());
+    assert_eq!(
+        post(&server, user_id, std::slice::from_ref(&titled)).await["data"]["results"][0]["status"],
+        "accepted"
+    );
+    // A replay cannot restore a title even if the session is now a placeholder.
+    sqlx::query("UPDATE chat_sessions SET title = 'Coding session' WHERE agent_id = $1")
+        .bind(agent_id)
+        .execute(&server.db)
+        .await
+        .expect("reset session title");
+    assert_eq!(
+        post(&server, user_id, &[titled]).await["data"]["results"][0]["status"],
+        "duplicate"
+    );
+    assert_eq!(session_title(&server, agent_id).await, "Coding session");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn conflicting_content_rolls_back_title_upgrade_and_receipt() {
+    let server = common::TestServer::start().await;
+    let (user_id, agent_id) = setup(&server).await;
+    let metadata = event("rollback-title", "turn-1", CapturePolicy::MetadataOnly);
+    assert_eq!(
+        post(&server, user_id, &[metadata]).await["data"]["results"][0]["status"],
+        "accepted"
+    );
+    // Simulate a pre-existing incomplete external turn, which rejects after receipt insertion.
+    sqlx::query(
+        "INSERT INTO chat_messages (session_id, external_turn_id, role, content) \
+         SELECT session_id, 'turn-2', 'user', 'existing question' FROM chat_sessions WHERE agent_id = $1",
+    )
+    .bind(agent_id)
+    .execute(&server.db)
+    .await
+    .expect("insert incomplete turn");
+    let mut titled = event("rollback-title", "turn-2", CapturePolicy::Content);
+    titled.session.title = Some("Must roll back".into());
+    let result = post(&server, user_id, std::slice::from_ref(&titled)).await;
+    assert_eq!(result["data"]["results"][0]["status"], "rejected");
+    assert_eq!(
+        result["data"]["results"][0]["error"],
+        "external turn is incomplete"
+    );
+    assert_eq!(session_title(&server, agent_id).await, "Coding session");
+    let receipt_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM coding_agent_telemetry_events WHERE user_id = $1 AND event_id = $2)",
+    )
+    .bind(user_id)
+    .bind(&titled.event_id)
+    .fetch_one(&server.db)
+    .await
+    .expect("query rolled back receipt");
+    assert!(!receipt_exists);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn title_upgrade_cannot_bypass_session_ownership_check() {
+    let server = common::TestServer::start().await;
+    let (user_id, agent_id) = setup(&server).await;
+    let metadata = event("ownership-title", "turn-1", CapturePolicy::MetadataOnly);
+    assert_eq!(
+        post(&server, user_id, &[metadata]).await["data"]["results"][0]["status"],
+        "accepted"
+    );
+    let other_user = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, username, email) VALUES ($1, 'other', 'other@test.local')")
+        .bind(other_user)
+        .execute(&server.db)
+        .await
+        .expect("create other owner");
+    sqlx::query("UPDATE chat_sessions SET user_id = $2 WHERE agent_id = $1")
+        .bind(agent_id)
+        .bind(other_user)
+        .execute(&server.db)
+        .await
+        .expect("change session owner");
+    let mut titled = event("ownership-title", "turn-2", CapturePolicy::Content);
+    titled.session.title = Some("Unauthorized title".into());
+    let result = post(&server, user_id, &[titled]).await;
+    assert_eq!(result["data"]["results"][0]["status"], "rejected");
+    assert_eq!(
+        result["data"]["results"][0]["error"],
+        "session already belongs to a different user or agent"
+    );
+    assert_eq!(session_title(&server, agent_id).await, "Coding session");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn invalid_titles_are_rejected_before_creating_sessions() {
+    let server = common::TestServer::start().await;
+    let (user_id, agent_id) = setup(&server).await;
+    for (index, title) in [
+        " \n".into(),
+        "title\0nul".into(),
+        "x".repeat(CODING_AGENT_SESSION_TITLE_MAX_BYTES + 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut invalid = event(
+            "invalid-title",
+            &format!("turn-{index}"),
+            CapturePolicy::Content,
+        );
+        invalid.session.title = Some(title);
+        assert_eq!(
+            post(&server, user_id, &[invalid]).await["data"]["results"][0]["status"],
+            "rejected"
+        );
+    }
+    let mut private = event("private-title", "turn", CapturePolicy::MetadataOnly);
+    private.session.title = Some("Private content".into());
+    assert_eq!(
+        post(&server, user_id, &[private]).await["data"]["results"][0]["status"],
+        "rejected"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_sessions WHERE agent_id = $1")
+        .bind(agent_id)
+        .fetch_one(&server.db)
+        .await
+        .expect("count sessions");
+    assert_eq!(count, 0);
     server.cleanup().await;
 }
 

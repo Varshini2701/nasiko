@@ -1,0 +1,20 @@
+-- Promotes the coding-agent "minimal code" toggle from a write-only encrypted
+-- secret (CODING_AGENT_MINIMAL_CODE, decrypted only at deploy time into the
+-- container's env) to a plain per-agent column, the same shape as the
+-- existing `writable` flag. Two things this unlocks:
+--
+-- 1. The Settings-tab switch can finally read back its real value instead of
+--    guessing from localStorage (agent secrets have no read-back route by
+--    design; this column does).
+-- 2. The control plane can read it at A2A dispatch time (every chat message),
+--    not just at container deploy time — which is what lets the
+--    minimal-code decision-ladder instructions be injected into the
+--    outgoing message by the server itself, instead of requiring every
+--    coding-style agent to vendor nasiko-coding-policy and build its own
+--    system prompt. See docs/CODING_AGENT_MINIMALISM.md.
+--
+-- Self-review is NOT covered by this migration — it still requires the
+-- agent's own visibility into whether it wrote/edited a file mid-task, which
+-- the control plane cannot see from the outside. It stays a deploy-time env
+-- var, read agent-side, same as today.
+ALTER TABLE agents ADD COLUMN minimal_code_enabled BOOLEAN NOT NULL DEFAULT false;

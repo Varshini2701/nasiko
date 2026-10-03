@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# Structural compression of history before selection (IP-4)
+nasiko-compress = { workspace = true }
 async-stream.workspace = true
 async-trait.workspace = true
 axum.workspace = true
@@ -20,10 +22,12 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }
+nasiko-agent-proxy.workspace = true
 nasiko-config.workspace = true
+nasiko-flow.workspace = true
 nasiko-types.workspace = true
-nasiko-observability.workspace = true
-nasiko-auth.workspace = true
+nasiko-hitl.workspace = true
 
 [dev-dependencies]
 mockito.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

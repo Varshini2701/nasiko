@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
@@ -167,48 +167,65 @@ impl TempoClient {
             .await
             .map_err(|e| ObservabilityError::Deserialization(e.to_string()))?;
 
-        let results = search_resp
-            .traces
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| {
+        let mut results = Vec::new();
+        let mut seen = HashSet::new();
+        for t in search_resp.traces.unwrap_or_default() {
+            let id = normalize_trace_id(&t.trace_id);
+            if seen.insert(id.clone()) {
                 let started_at = t.start_time_unix_nano.as_deref().and_then(parse_nanos_str);
-                (t.trace_id, started_at, t.duration_ms)
-            })
-            .collect();
+                results.push((id, started_at, t.duration_ms));
+            }
+        }
 
         Ok(results)
     }
 
     /// Fetch a full trace in OTLP JSON format.
+    ///
+    /// Retries up to 2 times on HTTP 429 (Tempo job queue full) with
+    /// exponential backoff (200ms, 600ms) to avoid cascading failures.
     pub async fn get_trace(&self, trace_id: &str) -> Result<TraceDetails, ObservabilityError> {
+        let normalized = normalize_trace_id(trace_id);
+        let trace_id = normalized.as_str();
         let url = format!("{}/api/traces/{}", self.base_url, trace_id);
 
-        let resp = self
-            .client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| ObservabilityError::TempoError(e.to_string()))?;
+        let mut backoff = std::time::Duration::from_millis(200);
+        let max_retries = 2u32;
 
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(ObservabilityError::NotFound(trace_id.to_string()));
+        for attempt in 0..=max_retries {
+            let resp = self
+                .client
+                .get(&url)
+                .header("Accept", "application/json")
+                .send()
+                .await
+                .map_err(|e| ObservabilityError::TempoError(e.to_string()))?;
+
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(ObservabilityError::NotFound(trace_id.to_string()));
+            }
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < max_retries {
+                tokio::time::sleep(backoff).await;
+                backoff *= 3;
+                continue;
+            }
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ObservabilityError::TempoError(format!(
+                    "HTTP {status}: {body}"
+                )));
+            }
+
+            let otlp: OtlpTraceResponse = resp
+                .json()
+                .await
+                .map_err(|e| ObservabilityError::Deserialization(e.to_string()))?;
+
+            return parse_otlp_trace(trace_id, otlp);
         }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ObservabilityError::TempoError(format!(
-                "HTTP {status}: {body}"
-            )));
-        }
 
-        let otlp: OtlpTraceResponse = resp
-            .json()
-            .await
-            .map_err(|e| ObservabilityError::Deserialization(e.to_string()))?;
-
-        parse_otlp_trace(trace_id, otlp)
+        unreachable!()
     }
 }
 
@@ -216,10 +233,37 @@ impl TempoClient {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Canonical spelling for trace IDs from Tempo and the session index.
+///
+/// Tempo's `/api/search` endpoint returns `traceID` as a plain hex string with
+/// leading zero *nibbles* stripped (a real, observed Tempo behavior — unlike
+/// `/api/traces/{id}`'s OTLP JSON, which encodes IDs as base64 bytes that
+/// `otlp_id_to_hex` re-derives correctly via `hex::encode`, always exactly 32
+/// chars for a 128-bit trace ID). Without re-padding, a trace whose ID happens
+/// to start with `0` comes back as 31 (or fewer) hex chars — a different string
+/// than the same trace's ID everywhere else it's used (traceparent headers,
+/// `get_trace` calls), so it silently becomes a second, duplicate row wherever
+/// trace ID is used as a dedup/primary key (confirmed: this caused doubled rows,
+/// and inflated totals, in `trace_usage`).
+///
+/// Only strings that are actually hex of at most 32 chars are touched — anything
+/// else (a test fixture, or some future non-hex ID Tempo returns) is left alone
+/// rather than corrupted into a 32-char string that matches nothing.
+pub(crate) fn normalize_trace_id(id: &str) -> String {
+    if !id.is_empty() && id.len() <= 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        format!("{id:0>32}").to_ascii_lowercase()
+    } else {
+        id.to_owned()
+    }
+}
+
 /// OTLP protobuf JSON encodes spanId/parentSpanId as base64.
 /// Convert to lowercase hex so it matches the format Loki uses.
 /// If decoding fails (e.g. already hex), return the input unchanged.
 fn otlp_id_to_hex(id: &str) -> String {
+    if id.len() == 16 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return id.to_ascii_lowercase();
+    }
     base64::engine::general_purpose::STANDARD
         .decode(id)
         .map(hex::encode)
@@ -300,6 +344,7 @@ fn parse_otlp_trace(
     otlp: OtlpTraceResponse,
 ) -> Result<TraceDetails, ObservabilityError> {
     let mut spans = Vec::new();
+    let mut seen_span_ids = HashSet::new();
 
     for batch in &otlp.batches {
         let service_name = batch
@@ -310,6 +355,10 @@ fn parse_otlp_trace(
 
         for scope_spans in batch.scope_spans.as_deref().unwrap_or(&[]) {
             for span in &scope_spans.spans {
+                let span_id = otlp_id_to_hex(&span.span_id);
+                if !seen_span_ids.insert(span_id.clone()) {
+                    continue;
+                }
                 let started_at = parse_nanos_str(&span.start_time_unix_nano).unwrap_or_default();
                 let ended_at = span.end_time_unix_nano.as_deref().and_then(parse_nanos_str);
 
@@ -343,7 +392,7 @@ fn parse_otlp_trace(
                     .collect();
 
                 spans.push(Span {
-                    span_id: otlp_id_to_hex(&span.span_id),
+                    span_id,
                     parent_span_id: span.parent_span_id.as_deref().map(otlp_id_to_hex),
                     name: span.name.clone(),
                     kind: parse_span_kind(span.kind.as_deref()),
@@ -382,4 +431,68 @@ fn parse_otlp_trace(
         ended_at,
         duration_ms,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{OtlpTraceResponse, normalize_trace_id, parse_otlp_trace};
+
+    #[test]
+    fn normalize_trace_id_restores_a_stripped_leading_zero() {
+        assert_eq!(
+            normalize_trace_id("81423c37451c04a19701dbf92626ee4"),
+            "081423c37451c04a19701dbf92626ee4"
+        );
+    }
+
+    #[test]
+    fn normalize_trace_id_leaves_a_full_length_id_unchanged() {
+        let full = "d505d94088a7d0fdc5c7a32bb790ee26";
+        assert_eq!(normalize_trace_id(full), full);
+    }
+
+    #[test]
+    fn normalize_trace_id_leaves_non_hex_ids_unchanged() {
+        // Not a real trace ID's shape (e.g. a test fixture) — must not be
+        // corrupted into a 32-char string that matches nothing real.
+        assert_eq!(normalize_trace_id("t-cheap"), "t-cheap");
+    }
+
+    #[test]
+    fn hex_span_ids_are_not_misdecoded_as_base64() {
+        assert_eq!(
+            super::otlp_id_to_hex("abcdef0123456789"),
+            "abcdef0123456789"
+        );
+        assert_eq!(super::otlp_id_to_hex("q83vASNFZ4k="), "abcdef0123456789");
+    }
+
+    #[test]
+    fn otlp_replayed_span_is_emitted_and_counted_once() {
+        let span = json!({
+            "spanId": "span-1",
+            "name": "ChatCompletion",
+            "startTimeUnixNano": "1724068800000000000",
+            "endTimeUnixNano": "1724068801000000000",
+            "attributes": [
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "25"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "5"}}
+            ],
+            "events": []
+        });
+        let otlp: OtlpTraceResponse = serde_json::from_value(json!({
+            "batches": [{
+                "resource": {"attributes": []},
+                "scopeSpans": [{"spans": [span.clone(), span]}]
+            }]
+        }))
+        .unwrap();
+
+        let trace = parse_otlp_trace("trace-1", otlp).unwrap();
+
+        assert_eq!(trace.spans.len(), 1);
+        assert_eq!(trace.token_totals(), (25, 5, None));
+    }
 }

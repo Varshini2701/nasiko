@@ -324,6 +324,13 @@ pub struct DeploymentSpec {
     /// `writable` subdirectory path (`{owner_id}/{container_id}`) — see
     /// `writable`'s doc comment. Not read at all when `writable` is `false`.
     pub owner_id: uuid::Uuid,
+    /// Force a fresh registry pull even when the daemon already has an image
+    /// with this exact ref cached locally — the difference between "reuse
+    /// what's cached" and "get whatever the tag currently points to right
+    /// now" for a mutable tag like `:latest`. Every existing deploy path
+    /// defaults this to `false` (unchanged behavior: reuse the local cache).
+    /// `DockerRuntime` reads this; `KubeRuntime` does not use it yet.
+    pub force_pull: bool,
 }
 
 /// Validates a `--writable-path` mount target. Both backends consume the path
@@ -346,6 +353,144 @@ pub fn validate_writable_path(path: &str) -> std::result::Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Validates a path *inside* an agent's writable directory, as supplied by a
+/// client asking to download one file. Unlike [`validate_writable_path`] — which
+/// vets an absolute mount target — this vets untrusted user input that is about
+/// to be joined onto the agent's own subdirectory, so it must be relative and
+/// must not be able to climb out of it. `pub` so the server rejects a bad path
+/// at request time (400) rather than handing it to a runtime.
+pub fn validate_workspace_relative_path(path: &str) -> std::result::Result<(), String> {
+    let bad = path.is_empty()
+        || path.starts_with('/')
+        || path.len() > 255
+        // `..` anywhere, and a bare `.`, would resolve outside (or alias) the
+        // agent's subdirectory once joined.
+        || path.split('/').any(|seg| seg == ".." || seg == "." || seg.is_empty())
+        || path.chars().any(|c| c == ':' || c == '\\' || c.is_control());
+    if bad {
+        return Err(format!(
+            "path `{path}` must be relative to the agent's writable directory, \
+             without `.`/`..` or empty segments, `:`, `\\` or control characters, ≤255 chars"
+        ));
+    }
+    Ok(())
+}
+
+/// Shell body (run as `sh -c <script> _ <agent_dir> <rel_path>`) that resolves
+/// the requested file, proves it stays inside `agent_dir` (the agent's own
+/// subdirectory, the containment fence) after every symlink is followed, and
+/// prints its size. `$1` is that directory, `$2` the caller's
+/// already-[`validate_workspace_relative_path`]d relative path.
+///
+/// The containment re-check has to live in the reader even though the server
+/// validated `rel_path`: the reader mounts the volume read-only, but the agent
+/// has read-write access to the same bytes through its own mount and can swap a
+/// symlink in at any moment, so a lexical server-side check alone is not enough
+/// — the bytes about to be read must be re-proven inside the agent's own
+/// subtree. `scope_dir` is trusted (the runtime builds it from validated
+/// components); only the resolved file is checked against it.
+pub const WORKSPACE_STAT_SCRIPT: &str = "t=$(readlink -f \"$1/$2\") || exit 1; \
+case \"$t\" in \"$1\"/*) ;; *) exit 1;; esac; \
+[ -f \"$t\" ] && stat -c '%s' \"$t\"";
+
+/// Companion to [`WORKSPACE_STAT_SCRIPT`] that streams the file rather than
+/// sizing it, applying the identical resolve-and-contain check in the same
+/// shell as the `cat` (so a symlink swapped in after the stat still cannot
+/// escape). Writes to stderr on every rejection so a stderr-sensitive caller
+/// (`DockerRuntime`'s `exec_stream`) surfaces it as an error instead of an
+/// empty body.
+pub const WORKSPACE_CAT_SCRIPT: &str = "t=$(readlink -f \"$1/$2\") || \
+{ echo 'no such file' >&2; exit 1; }; \
+case \"$t\" in \"$1\"/*) ;; *) echo 'path escapes workspace' >&2; exit 1;; esac; \
+[ -f \"$t\" ] || { echo 'not a regular file' >&2; exit 1; }; \
+exec cat \"$t\"";
+
+/// Shell body (run as `sh -c <script> _ <agent_dir>`) that prepares a
+/// `--writable` agent's directory: create it and hand it to uid 65534 (the uid
+/// such agents run as) so the agent can write to `/workspace`. Idempotent; runs
+/// on container (re)creation for Docker and on every pod start for Kubernetes.
+///
+/// Per-user isolation is no longer a filesystem concern here: the server
+/// captures each turn's writes onto the assistant message, session-scoped, so
+/// there is no root-owned `u/` parent to
+/// build.
+///
+/// Shared verbatim by `DockerRuntime`'s init helper and `KubeRuntime`'s writable
+/// initContainer (both run as root with the default capability set, which
+/// includes the `CHOWN` this step needs) so the two never drift.
+pub const WORKSPACE_SETUP_SCRIPT: &str = "set -e; mkdir -p \"$1\"; \
+[ \"$(stat -c %u \"$1\")\" = 65534 ] || chown -R 65534:65534 \"$1\"";
+
+/// Shell body (`sh -c <script> _ <dir>`) that lists the regular files under
+/// `$1` as `<size> <path>` lines. **Hidden files and directories are pruned**:
+/// a dotfile under `/workspace` is an agent's own internal state — an opencode
+/// HOME (`.cache`/`.config`/`.local`), a `.git`, an editor's scratch — not a
+/// user-facing deliverable, and one such agent can otherwise bury the actual
+/// output under thousands of cache files. A hidden file is still downloadable by
+/// explicit path (the download path does not filter); it just isn't offered in
+/// the listing. Pruning (not merely filtering) also skips descending those
+/// trees, so a listing stays fast on a large HOME.
+///
+/// The `stat` runs behind `sh -c '… 2>/dev/null || true'` so a file removed
+/// mid-walk (a coding agent churning temp files right as capture runs) is
+/// silently dropped from the listing instead of making the whole `find` exit
+/// non-zero — which the exec wrappers treat as a hard error, losing every chip.
+/// `find`'s *own* traversal errors (an unreadable subdir) still propagate.
+pub const WORKSPACE_LIST_SCRIPT: &str = "[ -d \"$1\" ] || exit 0; find \"$1\" -name '.*' -prune -o -type f -exec sh -c 'stat -c \"%Y %s %n\" \"$@\" 2>/dev/null || true' _ {} +";
+
+/// Identifies one agent's subdirectory of the shared agent-memory volume — the
+/// `{owner_id}/{container_id}` layout described on [`DeploymentSpec::writable`].
+///
+/// A [`ContainerId`] alone is not enough: the volume-side path is owner-scoped,
+/// and the runtime has no way to look the owner up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRef {
+    pub owner_id: uuid::Uuid,
+    pub container_id: ContainerId,
+}
+
+impl WorkspaceRef {
+    /// The agent's own subdirectory relative to the volume root
+    /// (`{owner_id}/{container_id}`) — the directory backends `find` in and the
+    /// fence they contain reads to. Must match whatever each backend mounts.
+    pub fn subpath(&self) -> String {
+        format!("{}/{}", self.owner_id, self.container_id.as_str())
+    }
+}
+
+/// One file in an agent's writable directory, as reported by
+/// [`crate::ContainerRuntime::list_workspace`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceEntry {
+    /// Path relative to the agent's writable directory, e.g. `notes/todo.md`.
+    /// This is exactly what `read_workspace_file` expects back.
+    pub path: String,
+    pub size: u64,
+    /// Unix mtime in seconds, from the preceding `stat`. Advisory metadata (e.g.
+    /// recency); the file-capture path attributes by the agent's reply, not time.
+    pub mtime: i64,
+}
+
+/// A single file streamed out of an agent's writable directory.
+///
+/// Deliberately a stream rather than a `Vec<u8>`: the backing volume is
+/// typically 20Gi, and buffering whole files would make N concurrent downloads
+/// an N-times-file-size memory spike on the control plane.
+pub struct WorkspaceFile {
+    /// Byte length as of the preceding stat, for `Content-Length`. Advisory —
+    /// a file rewritten mid-read can make the stream disagree.
+    pub size: u64,
+    pub stream: futures_util::stream::BoxStream<'static, crate::Result<bytes::Bytes>>,
+}
+
+impl std::fmt::Debug for WorkspaceFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspaceFile")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Distinguishes agent deployments from MCP connector deployments so that

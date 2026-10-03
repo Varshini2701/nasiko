@@ -64,9 +64,9 @@ impl<S: Send + Sync> FromRequestParts<S> for PullOnlyIdentity {
 }
 
 /// Fixed username the shared build-push credential logs in as (HTTP Basic
-/// auth). Must match `ee/cli/src/cluster/render.rs`'s `BUILD_PUSH_USERNAME`
+/// auth). Must match the enterprise CLI's `BUILD_PUSH_USERNAME`
 /// literal — that's where the matching `.dockerconfigjson` Secret is
-/// rendered; the two aren't code-linked (`ee/cli` doesn't depend on this
+/// rendered; the two aren't code-linked (the enterprise CLI doesn't depend on this
 /// crate) so they're kept in sync by convention, documented on both sides.
 pub const BUILD_SERVICE_USERNAME: &str = "build-service";
 
@@ -256,13 +256,11 @@ pub async fn check_pull_access(state: &OciState, caller: &Caller, repo: &str) ->
             let bound_repo = match bound_repo {
                 Some(name) => Some(name),
                 None => {
-                    sqlx::query_scalar(
-                        "SELECT 'mcp-' || name FROM mcp_connectors WHERE id = $1",
-                    )
-                    .bind(pull.agent_id)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .map_err(OciError::Database)?
+                    sqlx::query_scalar("SELECT 'mcp-' || name FROM mcp_connectors WHERE id = $1")
+                        .bind(pull.agent_id)
+                        .fetch_optional(&state.pool)
+                        .await
+                        .map_err(OciError::Database)?
                 }
             };
             if bound_repo.as_deref() == Some(repo) {

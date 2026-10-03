@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-nasiko-auth = { workspace = true }
 # LLM orchestration
-rig-core = { version = "0.11", default-features = false, features = ["derive"] }
+rig-core = { workspace = true }
+nasiko-llm-router = { workspace = true }
+async-stream = { workspace = true }
 
 # Async & streaming
 tokio = { workspace = true }
@@ -22,6 +23,9 @@ reqwest = { workspace = true }
 # A2A wire-shape helpers (SSE event classification, text extraction)
 nasiko-types = { workspace = true }
 
+# Structural compression of stored tool results (IP-3)
+nasiko-compress = { workspace = true }
+
 # Error handling
 thiserror = { workspace = true }
 
@@ -32,7 +36,12 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 tracing-subscriber = { workspace = true }
+# src/tool.rs's tests stand up a mockito server for the A2A HTTP calls. This
+# line was dropped by the [oss-import] replay in f8dc3472 (the public repo's
+# copy of this manifest never had it) while the tests that need it stayed —
+# `cargo test -p nasiko-react-agent --lib` has not compiled since.
 mockito = { workspace = true }
 
 [[example]]

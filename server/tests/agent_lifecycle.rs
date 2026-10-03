@@ -424,15 +424,37 @@ async fn list_upload_agents_scoped_to_owner() {
             .unwrap();
     let other_user: Uuid = other_resp["id"].as_str().unwrap().parse().unwrap();
 
+    // Each upload needs a real agent row. The listing inner-joins `agents` to
+    // pull live metadata (tags, description, version, status), so an
+    // upload_status row with a null agent_id is invisible — and the real
+    // pipeline never produces one: `agents/upload.rs:673` seeds the row with
+    // the agent_id already in hand, precisely so my-uploads can report it
+    // immediately.
+    let mine_agent: Uuid =
+        sqlx::query_scalar("INSERT INTO agents (name, owner_id) VALUES ('mine', $1) RETURNING id")
+            .bind(uid_uuid)
+            .fetch_one(&server.db)
+            .await
+            .unwrap();
+    let theirs_agent: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (name, owner_id) VALUES ('theirs', $1) RETURNING id",
+    )
+    .bind(other_user)
+    .fetch_one(&server.db)
+    .await
+    .unwrap();
+
     sqlx::query(
-        "INSERT INTO upload_status (upload_id, agent_name, owner_id, status) VALUES
-         ($1, 'mine',   $2, 'completed'::upload_pipeline_status),
-         ($3, 'theirs', $4, 'completed'::upload_pipeline_status)",
+        "INSERT INTO upload_status (upload_id, agent_name, owner_id, agent_id, status) VALUES
+         ($1, 'mine',   $2, $3, 'completed'::upload_pipeline_status),
+         ($4, 'theirs', $5, $6, 'completed'::upload_pipeline_status)",
     )
     .bind("upload-mine")
     .bind(uid_uuid)
+    .bind(mine_agent)
     .bind("upload-theirs")
     .bind(other_user)
+    .bind(theirs_agent)
     .execute(&server.db)
     .await
     .unwrap();
@@ -456,14 +478,19 @@ async fn list_upload_agents_scoped_to_owner() {
     );
     assert_eq!(records[0]["agent_name"].as_str().unwrap(), "mine");
 
-    // Superuser sees both.
+    // And a superuser sees no more than that. "My uploads" is the caller's own
+    // list by definition — `agents/upload.rs:2051` filters on owner_id with no
+    // superuser branch, deliberately. The assertion used to read the other way
+    // round and expect both rows.
     let res = get_as_superuser(&server, uid, "/api/agents/my-uploads").await;
     let body: Value = res.json().await.unwrap();
+    let records = body["data"].as_array().unwrap();
     assert_eq!(
-        body["data"].as_array().unwrap().len(),
-        2,
-        "superuser should see all uploads"
+        records.len(),
+        1,
+        "my-uploads is own-only, superuser included"
     );
+    assert_eq!(records[0]["agent_name"].as_str().unwrap(), "mine");
 
     server.cleanup().await;
 }
@@ -472,7 +499,10 @@ async fn list_upload_agents_scoped_to_owner() {
 
 #[tokio::test]
 #[serial]
-async fn list_versions_empty_for_new_agent() {
+async fn list_versions_starts_with_the_creation_version() {
+    // Creating an agent seeds its first `agent_versions` row
+    // (`catalog/routes.rs:306`), so a new agent has one version, not none.
+    // This asserted zero, from before that seeding existed.
     let server = common::TestServer::start().await;
     let admin = init_admin(&server).await;
     let uid = admin["user_id"].as_str().unwrap();
@@ -483,8 +513,15 @@ async fn list_versions_empty_for_new_agent() {
     let res = get_as_superuser(&server, uid, &format!("/api/agents/{agent_id}/versions")).await;
     assert_eq!(res.status(), 200);
     let body: Value = res.json().await.unwrap();
-    assert!(body.is_array());
-    assert_eq!(body.as_array().unwrap().len(), 0);
+    // `{ data, status_code, message }` — the standard envelope
+    // (`catalog/routes.rs:988`), not a bare array. Both tests here read the
+    // body directly, from before the endpoint was wrapped.
+    let versions = body["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected an envelope with a data array, got {body}"));
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0]["version"].as_str().unwrap(), "1.0.0");
+    assert!(versions[0]["is_active"].as_bool().unwrap());
 
     server.cleanup().await;
 }
@@ -499,12 +536,23 @@ async fn list_versions_returns_seeded_versions() {
     let agent = create_agent(&server, uid, "versioned-agent", "1.0.0").await;
     let agent_id: Uuid = agent["id"].as_str().unwrap().parse().unwrap();
 
-    // Seed two versions directly.
+    // 1.0.0 already exists — creating the agent seeded it
+    // (`catalog/routes.rs:306`). This used to insert it again and died on the
+    // (agent_id, version) unique constraint. Demote it and add the successor,
+    // which is what a real version bump does.
+    sqlx::query(
+        "UPDATE agent_versions
+            SET is_active = false, can_rollback = true, status = 'archived',
+                image_tag = 'versioned-agent:1.0.0'
+          WHERE agent_id = $1 AND version = '1.0.0'",
+    )
+    .bind(agent_id)
+    .execute(&server.db)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO agent_versions (agent_id, version, image_tag, is_active, can_rollback, status)
-         VALUES
-           ($1, '1.0.0', 'versioned-agent:1.0.0', false, true,  'archived'),
-           ($1, '1.0.1', 'versioned-agent:1.0.1', true,  false, 'active')",
+         VALUES ($1, '1.0.1', 'versioned-agent:1.0.1', true, false, 'active')",
     )
     .bind(agent_id)
     .execute(&server.db)
@@ -514,7 +562,9 @@ async fn list_versions_returns_seeded_versions() {
     let res = get_as_superuser(&server, uid, &format!("/api/agents/{agent_id}/versions")).await;
     assert_eq!(res.status(), 200);
     let body: Value = res.json().await.unwrap();
-    let versions = body.as_array().unwrap();
+    let versions = body["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected an envelope with a data array, got {body}"));
     assert_eq!(versions.len(), 2);
 
     // Ordered by created_at DESC → 1.0.1 first.

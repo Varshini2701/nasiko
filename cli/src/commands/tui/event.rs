@@ -106,6 +106,9 @@ fn do_stream_request(
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": uuid::Uuid::new_v4().to_string(),
+        // gRPC-style JSON-RPC method/role names — what every example agent's
+        // installed `a2a-sdk` actually registers in its dispatch table
+        // (confirmed against a real deployed `oss/agents/translator` build).
         "method": "SendStreamingMessage",
         "params": {
             "message": {
@@ -132,7 +135,7 @@ fn do_stream_request(
     let mut req = http
         .post(endpoint)
         .header("Content-Type", "application/json")
-        .header("A2A-Version", "1.0")
+        .header("A2A-Version", nasiko_types::a2a::A2A_VERSION_HEADER_VALUE)
         .header("traceparent", &traceparent);
     if let Some(ref t) = token {
         req = req.header("Authorization", &format!("Bearer {t}"));

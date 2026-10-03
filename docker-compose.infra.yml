@@ -65,6 +65,8 @@ services:
     depends_on:
       - tempo
       - loki
+    networks:
+      - nasiko
 
   tempo:
     image: grafana/tempo:2.6.1
@@ -73,12 +75,20 @@ services:
       - ./observability/config/tempo.yaml:/etc/tempo.yaml
     ports:
       - "3200:3200"   # Tempo HTTP query API
+    networks:
+      - nasiko
 
   loki:
     image: grafana/loki:3.3.2
     command: ["-config.file=/etc/loki/local-config.yaml"]
     ports:
       - "3100:3100"   # Loki HTTP API
+    networks:
+      - nasiko
+
+networks:
+  nasiko:
+    name: nasiko
 
 volumes:
   postgres-data:

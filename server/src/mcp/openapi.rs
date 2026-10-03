@@ -3,7 +3,7 @@
 //! Kept as its own `OpenApi` derive (rather than adding these paths to the
 //! main `crate::openapi::ApiDoc`) so the MCP surface stays self-contained;
 //! `crate::openapi` merges [`McpApiDoc`] into the served spec the same way
-//! `ee/server/src/openapi.rs` merges via `spec.merge(...)`.
+//! The EE server merges via `spec.merge(...)`.
 
 use utoipa::OpenApi;
 

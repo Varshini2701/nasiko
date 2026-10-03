@@ -64,13 +64,10 @@ pub fn deploy_with_version_flags(
 }
 
 /// Gets the currently-deployed version and full version history from an
-/// already-looked-up agent. Both come back empty for a brand-new agent.
-/// Shared by `deploy_from_directory` and `deploy_from_image`.
+/// already-looked-up agent. Empty for a brand-new agent.
 ///
-/// Propagates a history-fetch failure instead of treating it as "no
-/// history" — failing open there would let a duplicate/already-used version
-/// through the check in `resolve_deploy_version` and push/deploy over that
-/// version's content before the server gets a chance to reject the update.
+/// A history-fetch failure is propagated, not treated as "no history" —
+/// otherwise a reused version could slip past `resolve_deploy_version`.
 fn used_version_context<'a>(
     client: &Client,
     existing: Option<&'a (String, serde_json::Value)>,
@@ -99,12 +96,7 @@ fn already_pushed(
     let Some((id, _)) = existing else {
         return Ok(false);
     };
-    let status = client
-        .version_history(id)?
-        .into_iter()
-        .find(|v| v.version == version)
-        .map(|v| v.status);
-    Ok(status.as_deref() == Some("pushed"))
+    Ok(client.version_status(id, version)?.as_deref() == Some("pushed"))
 }
 
 /// Finds the existing agent for a directory deploy: first checks the local
@@ -190,6 +182,11 @@ fn deploy_from_directory(
         .or_else(|| card.get("name").and_then(|n| n.as_str()).map(String::from))
         .unwrap_or_else(|| "agent".into());
 
+    // Checked once up front, same signal `upload.rs`'s `source_references_mcp_gateway` uses for
+    // `nasiko upload` — this path builds straight from `root` and never zips it, so it walks the
+    // directory directly instead of scanning zip entries.
+    let references_mcp_gateway = crate::util::dir_references_mcp_gateway(root);
+
     // Find the agent first, so we can catch a same-version redeploy below.
     let agent_file = root.join(AGENT_FILE);
     let existing = find_existing_agent_binding(client, &agent_file, &agent_name)?;
@@ -263,6 +260,9 @@ fn deploy_from_directory(
                 eprintln!("  ! Deployed, but failed to update AgentCard.json's version: {e}");
             }
             println!("\n✓ Deployed {agent_name}:{version} (id: {id})");
+            if references_mcp_gateway {
+                print_mcp_gateway_hint(&agent_name);
+            }
             return Ok(());
         }
         None => {
@@ -306,9 +306,26 @@ fn deploy_from_directory(
         eprintln!("  ! Deployed, but failed to update AgentCard.json's version: {e}");
     }
     println!("\n✓ Deployed {agent_name}:{version} (id: {agent_id})");
+    if references_mcp_gateway {
+        print_mcp_gateway_hint(&agent_name);
+    }
     Ok(())
 }
 
+/// Same "give it tool access" suggestion `upload.rs` prints for a source that references the MCP
+/// gateway — kept here too since `deploy_from_directory` has its own two success points.
+fn print_mcp_gateway_hint(agent_name: &str) {
+    println!(
+        "\nThis agent's source references the MCP gateway — to give it tool access:\n\
+         \x20 nasiko mcp catalog                                      # find a connector\n\
+         \x20 nasiko mcp connect --connector-id <id>                  # connect your account (if not already)\n\
+         \x20 nasiko mcp agent-tools enable {agent_name} <id>                   # grant this agent access"
+    );
+}
+
+// Same eight values `deploy_with_version_flags` threads into
+// `deploy_from_directory` above, which carries the same allow.
+#[allow(clippy::too_many_arguments)]
 fn deploy_from_image(
     image: &str,
     name_override: Option<&str>,
@@ -319,6 +336,19 @@ fn deploy_from_image(
     writable_path: Option<&str>,
     client: &Client,
 ) -> Result<()> {
+    // A bare image name means Docker's implicit `:latest`, not a real
+    // choice — require an explicit tag so the deployed version always
+    // matches what `nasiko build` actually produced.
+    if !crate::util::image_has_explicit_tag(image) {
+        anyhow::bail!(
+            "deploy requires an explicit image:tag (e.g. {image}:1.0.1) — run `nasiko build` \
+             first, then deploy exactly the tag it printed."
+        );
+    }
+    if !oci::local_image_exists(image)? {
+        anyhow::bail!("no local image found for {image} — build it first with `nasiko build`.");
+    }
+
     let (image_name, image_tag_version) = parse_image_name_and_tag(image);
     let agent_name = name_override.map(String::from).unwrap_or(image_name);
     let repo = format!("nasiko/{agent_name}");
@@ -353,9 +383,13 @@ fn deploy_from_image(
         );
     } else {
         // Tag locally so Docker can find it by the canonical ref without a registry pull.
-        let _ = std::process::Command::new("docker")
+        let tag_status = std::process::Command::new(crate::util::container_bin())
             .args(["tag", image, &image_ref])
-            .status();
+            .status()
+            .context("failed to run container tag command — is the container runtime running?")?;
+        if !tag_status.success() {
+            anyhow::bail!("failed to tag {image} as {image_ref}");
+        }
 
         println!("Pushing {image} → {image_ref}...");
         oci::push_image(image, &repo, &version)?;

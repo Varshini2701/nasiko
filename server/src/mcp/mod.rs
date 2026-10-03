@@ -8,6 +8,7 @@ pub mod build;
 mod handlers;
 pub mod openapi;
 mod service;
+pub mod wiring;
 
 use axum::{
     Json, Router,
@@ -25,13 +26,44 @@ use nasiko_mcp_gateway::McpError;
 use crate::auth::Claims;
 use crate::state::AppState;
 
-pub use handlers::gateway::require_delegation;
 pub use handlers::sharing::grant_response;
 
-/// Agent-facing MCP JSON-RPC gateway — `POST /api/mcp` — mounted with
-/// [`require_delegation`], NOT `require_auth`.
+/// Agent-facing MCP JSON-RPC gateway — NOT behind `require_auth`: the handler
+/// authenticates the agent's deploy-time gateway credential and resolves the
+/// user from the flow record itself.
+///
+/// Two routes, one credential and one set of checks:
+/// - `POST /api/mcp` — credential in `Authorization: Bearer`. Preferred.
+/// - `POST /api/mcp/s/{token}` — credential in the path, for framework MCP
+///   clients that can only be handed a URL (see `handlers::gateway::mcp_gateway_via_url`).
 pub fn agent_gateway_router() -> Router<AppState> {
-    Router::new().route("/mcp", post(handlers::gateway::mcp_gateway))
+    Router::new()
+        .route("/mcp", post(handlers::gateway::mcp_gateway))
+        .route(
+            "/mcp/s/{token}",
+            post(handlers::gateway::mcp_gateway_via_url),
+        )
+}
+
+/// Path prefix of the URL-credential gateway form, whose next segment is a live
+/// agent credential.
+const CREDENTIAL_URI_PREFIX: &str = "/api/mcp/s/";
+
+/// Redact the agent credential carried by `/api/mcp/s/{token}` so it never
+/// reaches a tracing span, a log line, or the OTLP exporter fed by them.
+///
+/// Applied to the server's `TraceLayer` in `lib.rs`, which otherwise records the
+/// full request URI. Returns the URI unchanged for every other route, so normal
+/// request logging (query strings included) is untouched.
+///
+/// This covers the server side only. An agent's *own* HTTP client span still
+/// records `url.full`, which is why the URL form is documented as secret-bearing
+/// and the header form remains preferred.
+pub(crate) fn redact_credential_uri(uri: &axum::http::Uri) -> String {
+    if uri.path().starts_with(CREDENTIAL_URI_PREFIX) {
+        return format!("{CREDENTIAL_URI_PREFIX}{{token}}");
+    }
+    uri.to_string()
 }
 
 /// MCP-server-upload MUTATION routes (build a container from user-supplied
@@ -197,38 +229,44 @@ pub fn composio_callback_router() -> Router<AppState> {
 // ─── Shared error + auth helpers ────────────────────────────────────────────
 
 /// Standard API envelope: `{"data": …, "status_code": N, "message": "…"}`.
-/// `pub` (not `pub(crate)`) so `ee/server`'s own MCP-related handlers
+/// `pub` (not `pub(crate)`) so the EE server's own MCP-related handlers
 /// (`mcp_sharing.rs`) can produce the same envelope shape.
 pub struct ApiResponse {
     status: StatusCode,
     data: serde_json::Value,
-    message: &'static str,
+    message: std::borrow::Cow<'static, str>,
 }
 
 impl ApiResponse {
-    pub fn ok(data: serde_json::Value, message: &'static str) -> Self {
+    pub fn ok(data: serde_json::Value, message: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         Self {
             status: StatusCode::OK,
             data,
-            message,
+            message: message.into(),
         }
     }
 
-    pub fn created(data: serde_json::Value, message: &'static str) -> Self {
+    pub fn created(
+        data: serde_json::Value,
+        message: impl Into<std::borrow::Cow<'static, str>>,
+    ) -> Self {
         Self {
             status: StatusCode::CREATED,
             data,
-            message,
+            message: message.into(),
         }
     }
 
     /// 202 — request accepted, processing continues asynchronously (queued
     /// build jobs; see `handlers::upload`).
-    pub fn accepted(data: serde_json::Value, message: &'static str) -> Self {
+    pub fn accepted(
+        data: serde_json::Value,
+        message: impl Into<std::borrow::Cow<'static, str>>,
+    ) -> Self {
         Self {
             status: StatusCode::ACCEPTED,
             data,
-            message,
+            message: message.into(),
         }
     }
 }
@@ -241,7 +279,7 @@ impl IntoResponse for ApiResponse {
             Json(json!({
                 "data": self.data,
                 "status_code": code,
-                "message": self.message,
+                "message": self.message.as_ref(),
             })),
         )
             .into_response()
@@ -284,7 +322,7 @@ where
 }
 
 /// Wraps [`McpError`] as an HTTP response for the management routes. `pub` so
-/// `ee/server`'s MCP handlers can return it too (see [`ApiResponse`]).
+/// The EE server's MCP handlers can return it too (see [`ApiResponse`]).
 pub struct ApiError(pub McpError);
 
 impl IntoResponse for ApiError {
@@ -401,5 +439,47 @@ pub(crate) fn ensure_admin(claims: &Claims) -> Result<(), ApiError> {
         Err(ApiError(McpError::Forbidden(
             "admin privileges required for platform configuration".into(),
         )))
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::redact_credential_uri;
+
+    fn uri(s: &str) -> axum::http::Uri {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn strips_the_credential_segment() {
+        assert_eq!(
+            redact_credential_uri(&uri("/api/mcp/s/ngt_deadbeef")),
+            "/api/mcp/s/{token}"
+        );
+    }
+
+    #[test]
+    fn strips_it_with_a_query_string_too() {
+        // The token is in the path, so the whole URI is replaced rather than
+        // trying to reassemble it around the secret.
+        let redacted = redact_credential_uri(&uri("/api/mcp/s/ngt_deadbeef?trace=1"));
+        assert!(!redacted.contains("ngt_deadbeef"), "leaked: {redacted}");
+    }
+
+    #[test]
+    fn leaves_other_routes_untouched() {
+        assert_eq!(redact_credential_uri(&uri("/api/mcp")), "/api/mcp");
+        assert_eq!(
+            redact_credential_uri(&uri("/api/agents?page=2")),
+            "/api/agents?page=2"
+        );
+    }
+
+    #[test]
+    fn does_not_match_a_lookalike_prefix() {
+        assert_eq!(
+            redact_credential_uri(&uri("/api/mcp/share-targets")),
+            "/api/mcp/share-targets"
+        );
     }
 }

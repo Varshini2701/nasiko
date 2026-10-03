@@ -3,8 +3,12 @@
 //!   * `COMPOSIO_*` / bare name     → the composio backend, unchanged
 //!   * bare name, no composio       → first live backend
 
+use std::collections::HashMap;
+
+use uuid::Uuid;
+
 use crate::error::{McpError, Result};
-use crate::types::{MCPServerConfig, ServerType, connector_prefix};
+use crate::types::{MCPServerConfig, ServerType, UnusableConnector, connector_prefix};
 
 /// Resolve a tool name to its backend and the original (un-namespaced) tool name.
 ///
@@ -44,6 +48,23 @@ pub fn route_tool<'a>(
     Err(McpError::BadRequest(format!(
         "Unknown tool '{tool_name}' — no matching connector."
     )))
+}
+
+/// When [`route_tool`] fails for a `{prefix}__tool` name, check whether the
+/// prefix actually matches a connector the caller can reach but that's
+/// unusable right now (M1's `ConnectorUnusable`) — as opposed to a prefix
+/// that matches no known connector at all (hallucinated/stale tool name).
+/// Lets `tools/call` return a distinct "needs re-authentication" signal
+/// instead of the generic "not available" error for exactly that case.
+pub fn unusable_reason_for_prefix<'a>(
+    tool_name: &str,
+    unusable: &'a HashMap<Uuid, UnusableConnector>,
+) -> Option<(Uuid, &'a UnusableConnector)> {
+    let (prefix, _) = tool_name.split_once("__")?;
+    unusable
+        .iter()
+        .find(|(id, _)| connector_prefix(**id) == prefix)
+        .map(|(id, info)| (*id, info))
 }
 
 #[cfg(test)]
@@ -156,5 +177,52 @@ mod tests {
         let servers = vec![srv(ServerType::Mcp, id, "")];
         let name = format!("{}__search", connector_prefix(id));
         assert!(route_tool(&name, &servers).is_err());
+    }
+
+    // ─── unusable_reason_for_prefix ─────────────────────────────────────────
+
+    fn unusable_of(
+        id: Uuid,
+        reason: crate::types::ConnectorUnusable,
+    ) -> HashMap<Uuid, crate::types::UnusableConnector> {
+        HashMap::from([(
+            id,
+            crate::types::UnusableConnector {
+                reason,
+                name: "test-connector".into(),
+            },
+        )])
+    }
+
+    #[test]
+    fn unusable_reason_found_for_matching_prefix() {
+        let id = Uuid::new_v4();
+        let unusable = unusable_of(id, crate::types::ConnectorUnusable::AuthRequired);
+        let name = format!("{}__search", connector_prefix(id));
+        let (found_id, info) = unusable_reason_for_prefix(&name, &unusable).unwrap();
+        assert_eq!(found_id, id);
+        assert_eq!(info.reason, crate::types::ConnectorUnusable::AuthRequired);
+        assert_eq!(info.name, "test-connector");
+    }
+
+    #[test]
+    fn unusable_reason_is_none_for_unrelated_prefix() {
+        let id = Uuid::new_v4();
+        let unusable = unusable_of(id, crate::types::ConnectorUnusable::AuthRequired);
+        assert!(unusable_reason_for_prefix("deadbeef00000000__search", &unusable).is_none());
+    }
+
+    #[test]
+    fn unusable_reason_is_none_for_bare_name() {
+        let id = Uuid::new_v4();
+        let unusable = unusable_of(id, crate::types::ConnectorUnusable::AuthRequired);
+        assert!(unusable_reason_for_prefix("bare_tool_name", &unusable).is_none());
+    }
+
+    #[test]
+    fn unusable_reason_is_none_when_map_is_empty() {
+        let id = Uuid::new_v4();
+        let name = format!("{}__search", connector_prefix(id));
+        assert!(unusable_reason_for_prefix(&name, &HashMap::new()).is_none());
     }
 }

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use nasiko_runtime::{
     ContainerId, ContainerRuntime, DeploymentSpec, DeploymentStatus, InstanceInfo, Result,
+    WorkspaceEntry, WorkspaceFile, WorkspaceRef,
 };
 
 use crate::injector::{AgentContext, InstrumentationInjector};
@@ -106,15 +107,35 @@ impl<R: ContainerRuntime, I: InstrumentationInjector> ContainerRuntime
         self.inner.try_delete_autoscaler(id).await
     }
 
-    /// Forward secret refresh to the inner runtime. MUST be overridden here — the
-    /// trait's default is a no-op, so without this a K8s Secret rotation would be
-    /// silently dropped by the decorator (RUN-1) and never reach KubeRuntime.
+    /// Inject, then forward. MUST be overridden here — the trait's default is a
+    /// no-op, so without this a K8s Secret rotation would be silently dropped by
+    /// the decorator (RUN-1) and never reach KubeRuntime.
+    ///
+    /// The injection is not optional: `refresh_secrets` carries the agent's whole
+    /// desired environment and the Kubernetes backend applies it as such, so
+    /// forwarding the caller's raw map would *delete* every variable this
+    /// decorator stack adds at `deploy()` — `OTEL_*` from `OtelInjector`,
+    /// `MCP_GATEWAY_URL`/`MCP_GATEWAY_CONNECT_URL` from `McpInjector`. A restarted
+    /// agent would come back with no telemetry and no gateway endpoint. Running
+    /// the same injector here keeps refresh and deploy producing identical
+    /// environments.
     async fn refresh_secrets(
         &self,
         id: &ContainerId,
+        name: &str,
         env_vars: std::collections::HashMap<String, String>,
     ) -> Result<()> {
-        self.inner.refresh_secrets(id, env_vars).await
+        let mut patched = env_vars;
+        let ctx = AgentContext {
+            agent_id: name.to_string(),
+            tenant_id: self.tenant_id.clone(),
+            version: None,
+            capture_content: self.capture_content,
+            otel_collector_endpoint: self.otel_collector_endpoint.clone(),
+            otel_protocol: self.otel_protocol.clone(),
+        };
+        self.injector.inject(&mut patched, &ctx);
+        self.inner.refresh_secrets(id, name, patched).await
     }
 
     /// Forward instance listing to the inner runtime. MUST be overridden here — the
@@ -124,21 +145,41 @@ impl<R: ContainerRuntime, I: InstrumentationInjector> ContainerRuntime
     async fn list_instances(&self) -> Result<Vec<InstanceInfo>> {
         self.inner.list_instances().await
     }
+
+    /// Forward workspace listing to the inner runtime. MUST be overridden here —
+    /// the trait's default is an empty list, so without this every agent's
+    /// files would look absent no matter what the backend can see (RUN-1).
+    async fn list_workspace(&self, workspace: &WorkspaceRef) -> Result<Vec<WorkspaceEntry>> {
+        self.inner.list_workspace(workspace).await
+    }
+
+    /// Forward workspace file reads to the inner runtime. MUST be overridden
+    /// here — the trait's default is "unsupported", so without this every
+    /// download would fail even on a backend that supports it (RUN-1).
+    async fn read_workspace_file(
+        &self,
+        workspace: &WorkspaceRef,
+        rel_path: &str,
+    ) -> Result<WorkspaceFile> {
+        self.inner.read_workspace_file(workspace, rel_path).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::injector::AgentContext;
+    use crate::injector::{AgentContext, OtelInjector};
     use nasiko_runtime::RuntimeState;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// Inner runtime that records whether `refresh_secrets` reached it.
+    /// Inner runtime that records whether `refresh_secrets` reached it, and with
+    /// what environment.
     struct RecordingRuntime {
         refreshed: Arc<AtomicBool>,
+        refresh_env: Arc<Mutex<HashMap<String, String>>>,
     }
 
     #[async_trait]
@@ -180,9 +221,11 @@ mod tests {
         async fn refresh_secrets(
             &self,
             _id: &ContainerId,
-            _env: HashMap<String, String>,
+            _name: &str,
+            env: HashMap<String, String>,
         ) -> Result<()> {
             self.refreshed.store(true, Ordering::SeqCst);
+            *self.refresh_env.lock().unwrap() = env;
             Ok(())
         }
         async fn list_instances(&self) -> Result<Vec<InstanceInfo>> {
@@ -192,6 +235,25 @@ mod tests {
                 started_at: None,
                 ready: true,
             }])
+        }
+        async fn list_workspace(&self, _w: &WorkspaceRef) -> Result<Vec<WorkspaceEntry>> {
+            Ok(vec![WorkspaceEntry {
+                path: "marker-file".to_string(),
+                size: 3,
+                mtime: 0,
+            }])
+        }
+        async fn read_workspace_file(
+            &self,
+            _w: &WorkspaceRef,
+            _rel: &str,
+        ) -> Result<WorkspaceFile> {
+            Ok(WorkspaceFile {
+                size: 3,
+                stream: Box::pin(futures_util::stream::once(async {
+                    Ok(bytes::Bytes::from_static(b"abc"))
+                })),
+            })
         }
     }
 
@@ -229,6 +291,7 @@ mod tests {
             writable: false,
             writable_path: None,
             owner_id: uuid::Uuid::nil(),
+            force_pull: false,
         }
     }
 
@@ -241,6 +304,7 @@ mod tests {
         let rt = InstrumentedRuntime::new(
             RecordingRuntime {
                 refreshed: Arc::new(AtomicBool::new(false)),
+                refresh_env: Arc::new(Mutex::new(HashMap::new())),
             },
             CapturingInjector {
                 seen_tenant_id: seen.clone(),
@@ -264,6 +328,7 @@ mod tests {
         let rt = InstrumentedRuntime::new(
             RecordingRuntime {
                 refreshed: Arc::new(AtomicBool::new(false)),
+                refresh_env: Arc::new(Mutex::new(HashMap::new())),
             },
             CapturingInjector {
                 seen_tenant_id: seen.clone(),
@@ -288,6 +353,7 @@ mod tests {
         let rt = InstrumentedRuntime::new(
             RecordingRuntime {
                 refreshed: flag.clone(),
+                refresh_env: Arc::new(Mutex::new(HashMap::new())),
             },
             NoopInjector,
             "http://collector:4318".to_string(),
@@ -295,13 +361,114 @@ mod tests {
             false,
             None,
         );
-        rt.refresh_secrets(&ContainerId::new("agent"), HashMap::new())
+        rt.refresh_secrets(&ContainerId::new("agent"), "agent", HashMap::new())
             .await
             .expect("refresh_secrets should succeed");
         assert!(
             flag.load(Ordering::SeqCst),
             "InstrumentedRuntime must forward refresh_secrets to the inner runtime (RUN-1)"
         );
+    }
+
+    /// `refresh_secrets` carries the agent's *whole* desired environment and the
+    /// K8s backend server-side-applies it, so anything the injector adds at
+    /// `deploy()` must be re-added here. Without this, a K8s restart silently
+    /// stripped `OTEL_*` and the MCP gateway endpoint from the live Secret and the
+    /// agent came back blind and gateway-less.
+    #[tokio::test]
+    async fn refresh_secrets_reinjects_instrumentation() {
+        let captured = Arc::new(Mutex::new(HashMap::new()));
+        let rt = InstrumentedRuntime::new(
+            RecordingRuntime {
+                refreshed: Arc::new(AtomicBool::new(false)),
+                refresh_env: captured.clone(),
+            },
+            OtelInjector,
+            "http://collector:4318".to_string(),
+            "http/protobuf".to_string(),
+            false,
+            Some("tenant-a".to_string()),
+        );
+
+        let mut caller_env = HashMap::new();
+        caller_env.insert("AGENT_SECRET".to_string(), "kept".to_string());
+        rt.refresh_secrets(&ContainerId::new("agent-uuid"), "weather", caller_env)
+            .await
+            .expect("refresh_secrets should succeed");
+
+        let env = captured.lock().unwrap();
+        assert_eq!(
+            env.get("OTEL_EXPORTER_OTLP_ENDPOINT").map(String::as_str),
+            Some("http://collector:4318"),
+            "injected OTEL config must survive a secret refresh"
+        );
+        assert_eq!(
+            env.get("AGENT_SECRET").map(String::as_str),
+            Some("kept"),
+            "the caller's own secrets must still be forwarded"
+        );
+        // The decorator only has a ContainerId, which is the agent UUID; the
+        // service name must come from the name the caller threads through, or
+        // every restarted agent renames itself to a UUID in Tempo.
+        assert_eq!(
+            env.get("OTEL_SERVICE_NAME").map(String::as_str),
+            Some("weather"),
+            "refresh must use the agent name, not the container id, as service name"
+        );
+    }
+
+    /// A decorator over `RecordingRuntime` with the injector that changes
+    /// nothing — the shape every forwarding guard below needs.
+    fn instrumented() -> InstrumentedRuntime<RecordingRuntime, NoopInjector> {
+        InstrumentedRuntime::new(
+            RecordingRuntime {
+                refreshed: Arc::new(AtomicBool::new(false)),
+                refresh_env: Arc::new(Mutex::new(HashMap::new())),
+            },
+            NoopInjector,
+            "http://collector:4318".to_string(),
+            "http/protobuf".to_string(),
+            false,
+            None,
+        )
+    }
+
+    /// RUN-1 regression guard: the decorator must forward `list_workspace`. The
+    /// trait's default returns `[]`, so the marker entry is what distinguishes
+    /// "forwarded" from "silently fell through to the default".
+    #[tokio::test]
+    async fn list_workspace_forwards_to_inner() {
+        let rt = instrumented();
+        let files = rt
+            .list_workspace(&WorkspaceRef {
+                owner_id: uuid::Uuid::nil(),
+                container_id: ContainerId::new("agent"),
+            })
+            .await
+            .expect("list_workspace should succeed");
+        assert_eq!(
+            files.first().map(|f| f.path.as_str()),
+            Some("marker-file"),
+            "InstrumentedRuntime must forward list_workspace to the inner runtime (RUN-1)"
+        );
+    }
+
+    /// RUN-1 regression guard: the decorator must forward `read_workspace_file`.
+    /// The trait's default is an error, so merely succeeding proves forwarding.
+    #[tokio::test]
+    async fn read_workspace_file_forwards_to_inner() {
+        let rt = instrumented();
+        let file = rt
+            .read_workspace_file(
+                &WorkspaceRef {
+                    owner_id: uuid::Uuid::nil(),
+                    container_id: ContainerId::new("agent"),
+                },
+                "marker-file",
+            )
+            .await
+            .expect("InstrumentedRuntime must forward read_workspace_file (RUN-1)");
+        assert_eq!(file.size, 3);
     }
 
     /// RUN-1 regression guard: the decorator must forward `list_instances` to the
@@ -313,6 +480,7 @@ mod tests {
         let rt = InstrumentedRuntime::new(
             RecordingRuntime {
                 refreshed: Arc::new(AtomicBool::new(false)),
+                refresh_env: Arc::new(Mutex::new(HashMap::new())),
             },
             NoopInjector,
             "http://collector:4318".to_string(),

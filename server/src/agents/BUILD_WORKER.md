@@ -74,18 +74,22 @@ HTTP handler
   │  return 202 Accepted
   ▼
 build worker (background)
-  ├─ select! { notify | 5s poll | 10min recovery_tick }
+  ├─ drain loop — claims while in-flight < BUILD_CONCURRENCY (default 4)
+  │    claim_next_job()          ← SELECT … FOR UPDATE SKIP LOCKED + UPDATE in_progress
+  │      │  Ok(None)  → break (nothing claimable)
+  │      │  Ok(Some)  → continue
+  │    ├─ attempt cap check      ← fail immediately if attempt ≥ MAX_ATTEMPTS (3)
+  │    └─ JoinSet::spawn(wrapper)
+  │         └─ tokio::task::spawn(execute_claimed_job())
+  │              │  Ok(())       → slot frees
+  │              └─ is_panic()   → reset_panicked_job() immediately
   │
-  └─ drain loop
-       claim_next_job()          ← SELECT … FOR UPDATE SKIP LOCKED + UPDATE in_progress
-         │  Ok(None)  → break (queue empty)
-         │  Ok(Some)  → continue
-       ├─ attempt cap check      ← fail immediately if attempt ≥ MAX_ATTEMPTS (3)
-       └─ tokio::task::spawn(execute_claimed_job())
-            │  Ok(())            → check for next job
-            │  is_panic()        → reset_panicked_job() immediately
-            └─ cancelled         → break (server shutting down)
+  └─ select! { join_next | notify | 5s poll | 10min recovery_tick }
 ```
+
+Jobs run concurrently, but never two for the **same** agent or connector: they would resolve to
+the same image tag and deploy the same container, so `claim_next_job` skips a target that already
+has a build in flight. The row stays `pending` (it is not failed) and is claimed on a later pass.
 
 ---
 
@@ -118,21 +122,27 @@ The fix separates **claim** (minimal, no panic risk) from **execute** (runs insi
 `tokio::task::spawn`):
 
 ```rust
-// Phase 1 — claim (outer task, no spawn)
-let job = claim_next_job(&state).await?;
+// Phase 1 — claim (worker loop, no spawn)
+let job = claim_next_job(&state.db).await?;
 let job_id   = job.id;
 let old_attempt = job.attempt;   // pre-increment; DB now holds old_attempt + 1
 
-// Phase 2 — execute (spawned task; panic here does not kill the worker)
-match tokio::task::spawn(execute_claimed_job(state.clone(), job)).await {
-    Ok(())                       => { /* done */ }
-    Err(ref e) if e.is_panic()  => reset_panicked_job(&state.db, job_id, old_attempt).await,
-    Err(_)                       => break,   // task cancelled (server shutdown)
-}
+// Phase 2 — execute. The outer task holds a concurrency slot; the inner spawn
+// is what isolates the panic. Awaiting it here keeps job_id/old_attempt in
+// scope, so the reset happens immediately rather than 60 minutes later.
+tasks.spawn(async move {
+    match tokio::task::spawn(execute_claimed_job(state_clone, job)).await {
+        Ok(())                     => { /* done */ }
+        Err(ref e) if e.is_panic() => reset_panicked_job(&db, job_id, old_attempt).await,
+        Err(_)                     => {}   // unreachable: nothing aborts the inner task
+    }
+    in_flight.lock().unwrap().remove(&job_id);
+});
 ```
 
 `job_id` and `old_attempt` are captured **before** the spawn, so the panic arm can act on them
-without any shared state.
+without any shared state. The wrapper also clears the job from the in-flight set — see
+[Recovery strategies](#recovery-strategies) for why the sweep needs to know what is running.
 
 ---
 
@@ -175,17 +185,25 @@ images).
 UPDATE build_jobs SET status = 'failed', error_msg = 'max attempts exceeded', completed_at = now()
 WHERE status = 'in_progress'
   AND picked_at < now() - make_interval(mins => 60)
-  AND attempt >= 3;
+  AND attempt >= 3
+  AND id <> ALL($3);   -- jobs this worker is running right now
 
 -- Reset remaining stuck jobs for retry
 UPDATE build_jobs SET status = 'pending', picked_at = NULL
 WHERE status = 'in_progress'
   AND picked_at < now() - make_interval(mins => 60)
-  AND attempt < 3;
+  AND attempt < 3
+  AND id <> ALL($3);
 ```
 
 `make_interval(mins => $2)` keeps the threshold in a single Rust constant rather than duplicated
 SQL string literals.
+
+The `id <> ALL($3)` exclusion matters only because the worker is concurrent. While it was serial
+the loop sat blocked awaiting the running job, so the recovery tick could never fire mid-build.
+A concurrent worker returns to `select!` immediately, so without this a build that legitimately
+outlives `STUCK_JOB_MINS` would be reset to `pending`, re-claimed, and run a second time against
+the same image tag. Jobs belonging to *other* replicas cannot be vouched for and are still swept.
 
 ### Recovery matrix
 
@@ -203,6 +221,18 @@ SQL string literals.
 `FOR UPDATE SKIP LOCKED` ensures only one replica claims each job. Two replicas can call
 `claim_next_job` simultaneously — the second one skips the locked row and either claims a
 different pending job or returns `Ok(None)`.
+
+The same-target rule needs a second mechanism, because `NOT EXISTS` reads committed state: two
+replicas could both pass it before either commits, each claiming a sibling of the same target. So
+the claim also takes a `pg_try_advisory_xact_lock` keyed on the target id (`'a:'`/`'c:'` prefixed so
+the agent and connector id spaces cannot collide). That serializes the read-then-write, and the
+loser's subquery then sees the winner's `in_progress` row.
+
+`try_` rather than the blocking form, so a contended target is filtered out and left `pending` for
+the next drain instead of holding the transaction open. Note the predicate is evaluated on every
+candidate row the scan considers, not only the one `LIMIT` returns, so a busy queue briefly holds a
+lock per candidate; they last until the claim transaction commits, but it does mean a concurrent
+replica can come up empty while work exists and take it on the next pass.
 
 The `recover_stuck_jobs` queries are safe to run concurrently: both replicas will attempt the
 same `UPDATE … WHERE status = 'in_progress' AND picked_at < threshold`. Postgres last-write-wins
@@ -222,9 +252,12 @@ tokio::spawn(crate::agents::build_worker::run(worker_state, build_rx));
 previous replica are retried before the first HTTP request arrives.
 
 **Shutdown** — when the server receives SIGTERM, Tokio drops the `mpsc::Sender` (`build_tx`).
-The `notify.recv()` arm returns `None`, and the worker exits cleanly after its current drain
-loop iteration. In-flight `tokio::task::spawn` tasks run to completion (Tokio's default shutdown
-behavior), so a build that started just before SIGTERM will finish.
+The `notify.recv()` arm returns `None` and the worker returns **without draining**: in-flight jobs
+stay `in_progress` and are re-queued by `recover_stuck_jobs` on the next boot. Waiting instead
+could block for a full `build_timeout` (30 min) only to be killed at the pod's termination grace
+period. Note that returning drops the `JoinSet`, which aborts each wrapper task; the inner build
+task is merely detached (dropping a `JoinHandle` does not cancel it), so a panic during that
+window is not converted into an immediate reset — the stuck-job sweep covers it.
 
 ---
 
@@ -234,6 +267,7 @@ behavior), so a build that started just before SIGTERM will finish.
 |---|---|---|
 | `MAX_ATTEMPTS` | `3` | Maximum claim attempts before permanent failure |
 | `STUCK_JOB_MINS` | `60` | Minutes before a job is considered stuck (2× max build timeout) |
+| `BUILD_CONCURRENCY` | `4` | Builds in flight at once; clamped to 1..=16. Set `1` for the old serial behavior |
 | Channel capacity | `64` | `mpsc::channel(64)` — drops wake if worker is already draining |
 | Fallback poll | `5 s` | `tokio::time::sleep(5s)` — catches lost notifications |
 | Recovery interval | `10 min` | `interval_at` with `MissedTickBehavior::Skip` |

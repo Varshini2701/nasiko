@@ -1106,14 +1106,14 @@ async fn test_update_user_password_change_takes_effect_on_login() {
         admin_id,
         "admin",
     )
-    .json(&json!({"password": "brand-new-password123"}))
+    .json(&json!({"password": "Brand-New-Password123"}))
     .send()
     .await
     .unwrap();
     assert_eq!(res.status(), 200);
 
     // New password works.
-    let body = login(&server, &alice_key, "brand-new-password123").await;
+    let body = login(&server, &alice_key, "Brand-New-Password123").await;
     assert!(!body["token"].as_str().unwrap().is_empty());
 
     // Old secret no longer works — it was rotated, not merely supplemented.

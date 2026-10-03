@@ -21,6 +21,7 @@ use crate::provider::first_str;
 use crate::provider::generic::MCP_PROTOCOL_VERSION;
 use crate::repo::{self, McpConnector, McpUserConnection};
 use crate::state::McpState;
+use crate::types::ConnectorUnusable;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -28,22 +29,23 @@ const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const REFRESH_SKEW_MINUTES: i64 = 5;
 
 /// Return the access token to inject for an `oauth2` connector, refreshing first
-/// if near expiry. `Ok(None)` → caller skips this connector.
+/// if near expiry. `Err(reason)` → caller skips this connector, but now knows
+/// *why* instead of just that it's unusable.
 pub async fn access_token_for(
     state: &McpState,
     crypto: &SecretsCrypto,
     user_id: Uuid,
     connector: &McpConnector,
     conn: &McpUserConnection,
-) -> Result<Option<String>> {
+) -> Result<std::result::Result<String, ConnectorUnusable>> {
     let Some(access_enc) = conn.encrypted_credential.as_deref() else {
-        return Ok(None);
+        return Ok(Err(ConnectorUnusable::MissingCredential));
     };
     let access_plain = match crypto.decrypt(access_enc) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(connector = %connector.name, error = %e, "failed to decrypt oauth access token — skipping");
-            return Ok(None);
+            return Ok(Err(ConnectorUnusable::AuthRequired));
         }
     };
 
@@ -53,7 +55,7 @@ pub async fn access_token_for(
         .unwrap_or(false);
 
     if !near_expiry {
-        return Ok(Some(access_plain));
+        return Ok(Ok(access_plain));
     }
     refresh(state, crypto, user_id, connector, conn).await
 }
@@ -65,20 +67,20 @@ async fn refresh(
     user_id: Uuid,
     connector: &McpConnector,
     conn: &McpUserConnection,
-) -> Result<Option<String>> {
+) -> Result<std::result::Result<String, ConnectorUnusable>> {
     let (Some(refresh_enc), Some(token_endpoint)) = (
         conn.encrypted_refresh_token.as_ref(),
         connector.oauth_token_endpoint.as_ref(),
     ) else {
         tracing::warn!(connector = %connector.name, "oauth near expiry but no refresh token / endpoint — skipping");
-        return Ok(None);
+        return Ok(Err(ConnectorUnusable::AuthRequired));
     };
 
     let refresh_plain = match crypto.decrypt(refresh_enc) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(connector = %connector.name, error = %e, "failed to decrypt refresh token — skipping");
-            return Ok(None);
+            return Ok(Err(ConnectorUnusable::AuthRequired));
         }
     };
 
@@ -110,22 +112,22 @@ async fn refresh(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(connector = %connector.name, error = %e, "oauth refresh: bad token response");
-                return Ok(None);
+                return Ok(Err(ConnectorUnusable::AuthRequired));
             }
         },
         Ok(r) => {
             tracing::warn!(connector = %connector.name, status = r.status().as_u16(), "oauth refresh rejected");
-            return Ok(None);
+            return Ok(Err(ConnectorUnusable::AuthRequired));
         }
         Err(e) => {
             tracing::warn!(connector = %connector.name, error = %e, "oauth refresh request failed");
-            return Ok(None);
+            return Ok(Err(ConnectorUnusable::AuthRequired));
         }
     };
 
     let Some(new_access) = first_str(&body, &["access_token"]) else {
         tracing::warn!(connector = %connector.name, "oauth refresh response missing access_token");
-        return Ok(None);
+        return Ok(Err(ConnectorUnusable::AuthRequired));
     };
     let new_refresh = first_str(&body, &["refresh_token"]).unwrap_or(refresh_plain);
     let scope = first_str(&body, &["scope"]).or_else(|| conn.scope.clone());
@@ -149,7 +151,7 @@ async fn refresh(
     .map_err(|e| McpError::Internal(format!("failed to persist refreshed oauth token: {e}")))?;
 
     tracing::info!(connector = %connector.name, "refreshed oauth token");
-    Ok(Some(new_access))
+    Ok(Ok(new_access))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -679,6 +681,32 @@ pub async fn handle_callback(
     if outcome.verified {
         crate::connect::grant_user_agents_access(&state.db, oauth_state.user_id, connector.id)
             .await;
+        // The credential now works — resolve any hitl_requests rows that were
+        // waiting on exactly this fix so MCP's dispatcher (already running)
+        // nudges every paused conversation to retry. A plain function call,
+        // the same one the resolve API uses; no new store/dispatcher logic.
+        match nasiko_hitl::repo::resolve_pending_auth_required_for_connector(
+            &state.db,
+            oauth_state.user_id,
+            connector.id,
+        )
+        .await
+        {
+            Ok(resolved) if !resolved.is_empty() => {
+                tracing::info!(
+                    connector = %connector.name, user_id = %oauth_state.user_id,
+                    resolved_count = resolved.len(),
+                    "auto-resolved pending auth_required hitl requests after oauth callback"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e, connector = %connector.name, user_id = %oauth_state.user_id,
+                    "failed to auto-resolve pending auth_required hitl requests"
+                );
+            }
+        }
     }
     crate::session::invalidate_session_cache(state, oauth_state.user_id).await;
     tracing::info!(
@@ -799,7 +827,177 @@ pub async fn fetch_protected_resource_metadata(
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as B64Std;
+    use std::sync::Arc;
+
     use super::*;
+    use crate::config::{McpConfig, ToolSearchMode};
+    use crate::provider::{GenericMcpProvider, Providers};
+
+    /// Install a valid `SECRETS_ENCRYPTION_KEY` so `SecretsCrypto::for_user`
+    /// doesn't panic — mirrors `oss/secrets/tests/crypto.rs`'s `install_valid_key`.
+    fn install_valid_encryption_key() {
+        let key = B64Std.encode([0x24u8; 32]);
+        // SAFETY: all callers in this module install the same value, so a
+        // concurrent set from another test is not observably different.
+        unsafe { std::env::set_var("SECRETS_ENCRYPTION_KEY", &key) };
+    }
+
+    fn test_state() -> McpState {
+        let db = sqlx::PgPool::connect_lazy("postgres://user:pass@127.0.0.1:1/db")
+            .expect("lazy pool construction must not touch the network");
+        let redis = redis::Client::open("redis://127.0.0.1:1/").expect("lazy redis client");
+        McpState {
+            db,
+            redis,
+            http_client: reqwest::Client::new(),
+            guarded_http_client: reqwest::Client::new(),
+            config: McpConfig {
+                composio_api_key: None,
+                composio_base_url: "http://localhost".to_string(),
+                composio_webhook_secret: None,
+                gateway_public_url: None,
+                oauth_redirect_base_url: None,
+                composio_callback_base_url: None,
+                session_ttl_seconds: 60,
+                perm_cache_ttl_seconds: 60,
+                manifest_ttl_seconds: 60,
+                toolcount_ttl_seconds: 3600,
+                oauth_state_signing_key: "test".to_string(),
+                description_model: "gpt-4o-mini".to_string(),
+                hitl_request_ttl_days: 7,
+                tool_search_mode: ToolSearchMode::Semantic,
+                tool_search_tool_limit: 0,
+                tool_search_meta_limit: 0,
+                openai_api_key: None,
+                embedding_model: "".to_string(),
+            },
+            providers: Providers {
+                composio: None,
+                mcp: GenericMcpProvider::new(reqwest::Client::new(), reqwest::Client::new()),
+            },
+            authorizer: std::sync::Arc::new(crate::authorizer::OssConnectorAuthorizer),
+            endpoint_refresher: std::sync::Arc::new(crate::endpoint_refresh::NoopEndpointRefresher),
+            llm: nasiko_orchestrator::providers::LLMProvider::from_env(reqwest::Client::new()),
+            search_index: Arc::new(crate::search::NoopSearchIndex),
+        }
+    }
+
+    fn oauth_connector(token_endpoint: &str) -> McpConnector {
+        McpConnector {
+            id: Uuid::new_v4(),
+            provider_type: "mcp_server".into(),
+            owner_id: None,
+            name: "test-oauth-connector".into(),
+            display_name: None,
+            logo_url: None,
+            description: None,
+            auth_config_id: None,
+            auth_scheme: None,
+            use_composio_managed: None,
+            url: Some("https://example.com/mcp".into()),
+            transport: Some("streamable_http".into()),
+            auth_type: Some("oauth2".into()),
+            url_param_name: None,
+            credential_header_name: None,
+            headers: None,
+            is_active: Some(true),
+            oauth_authorization_endpoint: None,
+            oauth_token_endpoint: Some(token_endpoint.to_string()),
+            oauth_client_id: Some("client123".into()),
+            oauth_client_secret: None,
+            source_kind: crate::repo::SourceKind::ExternalUrl,
+            build_status: None,
+            container_image_tag: None,
+            setup_status: None,
+            setup_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn oauth_connection(
+        user_id: Uuid,
+        connector_id: Uuid,
+        crypto: &SecretsCrypto,
+    ) -> McpUserConnection {
+        McpUserConnection {
+            id: Uuid::new_v4(),
+            user_id,
+            connector_id,
+            status: "active".into(),
+            connected_account_id: None,
+            redirect_url: None,
+            oauth_url: None,
+            encrypted_credential: Some(crypto.encrypt("old-access-token")),
+            encrypted_refresh_token: Some(crypto.encrypt("refresh-token-value")),
+            token_expires_at: None,
+            scope: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_flags_auth_required_when_token_endpoint_rejects_request() {
+        install_valid_encryption_key();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/token")
+            .with_status(401)
+            .create_async()
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let crypto = SecretsCrypto::for_user(user_id);
+        let connector = oauth_connector(&format!("{}/token", server.url()));
+        let conn = oauth_connection(user_id, connector.id, &crypto);
+        let state = test_state();
+
+        let result = refresh(&state, &crypto, user_id, &connector, &conn)
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(result, Err(ConnectorUnusable::AuthRequired));
+    }
+
+    #[tokio::test]
+    async fn refresh_flags_auth_required_when_no_refresh_token_stored() {
+        install_valid_encryption_key();
+        let user_id = Uuid::new_v4();
+        let crypto = SecretsCrypto::for_user(user_id);
+        let connector = oauth_connector("https://unused.example.com/token");
+        let mut conn = oauth_connection(user_id, connector.id, &crypto);
+        conn.encrypted_refresh_token = None;
+        let state = test_state();
+
+        // No network call should happen — missing refresh token is caught before
+        // any request is sent.
+        let result = refresh(&state, &crypto, user_id, &connector, &conn)
+            .await
+            .unwrap();
+
+        assert_eq!(result, Err(ConnectorUnusable::AuthRequired));
+    }
+
+    #[tokio::test]
+    async fn access_token_for_flags_missing_credential_without_stored_access_token() {
+        install_valid_encryption_key();
+        let user_id = Uuid::new_v4();
+        let crypto = SecretsCrypto::for_user(user_id);
+        let connector = oauth_connector("https://unused.example.com/token");
+        let mut conn = oauth_connection(user_id, connector.id, &crypto);
+        conn.encrypted_credential = None;
+        let state = test_state();
+
+        let result = access_token_for(&state, &crypto, user_id, &connector, &conn)
+            .await
+            .unwrap();
+
+        assert_eq!(result, Err(ConnectorUnusable::MissingCredential));
+    }
 
     #[test]
     fn state_round_trips_and_rejects_tamper() {

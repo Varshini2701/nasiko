@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::OciState;
 use crate::error::{OciCode, OciError, Result};
-use crate::storage::S3Storage;
+use nasiko_runtime::BlobStore;
 
 pub async fn blob_exists(state: &OciState, digest: &str) -> bool {
     state.storage.blob_exists(digest).await
@@ -55,7 +55,7 @@ pub async fn get_blob_bytes(state: &OciState, repository: &str, digest: &str) ->
     if !state.storage.blob_exists(digest).await {
         return Err(OciError::blob_unknown(format!("blob {digest} not found")));
     }
-    state.storage.get_blob(digest).await
+    Ok(state.storage.get_blob(digest).await?)
 }
 
 /// Advisory-lock class for blob-digest locks, so they can never collide with any
@@ -87,7 +87,7 @@ async fn lock_blob_digest(tx: &mut sqlx::PgConnection, digest: &str) -> Result<(
 /// manifest that fails on its own layers.
 pub(crate) async fn claim_blob(
     tx: &mut sqlx::PgConnection,
-    storage: &S3Storage,
+    storage: &dyn BlobStore,
     repository: &str,
     digest: &str,
     absent_code: OciCode,
@@ -269,7 +269,7 @@ pub async fn mount_blob(
     let mut tx = state.pool.begin().await?;
     claim_blob(
         &mut tx,
-        &state.storage,
+        state.storage.as_ref(),
         repository,
         digest,
         OciCode::BlobUnknown,
@@ -462,7 +462,7 @@ async fn store_and_claim(
     let mut tx = state.pool.begin().await?;
     claim_blob(
         &mut tx,
-        &state.storage,
+        state.storage.as_ref(),
         repository,
         &computed,
         OciCode::BlobUnknown,

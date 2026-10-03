@@ -10,8 +10,8 @@ use std::sync::Arc;
 use axum::Router;
 use bytes::BytesMut;
 use dashmap::DashMap;
+use nasiko_runtime::BlobStore;
 use sqlx::PgPool;
-use storage::S3Storage;
 use uuid::Uuid;
 
 pub use authz::{
@@ -24,12 +24,12 @@ pub use authz::{
 #[derive(Clone)]
 pub struct OciState {
     pub pool: PgPool,
-    pub storage: S3Storage,
+    pub storage: Arc<dyn BlobStore>,
     pub upload_buffers: Arc<DashMap<Uuid, BytesMut>>,
 }
 
 impl OciState {
-    pub fn new(pool: PgPool, storage: S3Storage) -> Self {
+    pub fn new(pool: PgPool, storage: Arc<dyn BlobStore>) -> Self {
         Self {
             pool,
             storage,

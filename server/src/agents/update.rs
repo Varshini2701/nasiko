@@ -535,6 +535,8 @@ pub async fn execute_agent_update(
             Some(agent_owner_id),
         )
         .await;
+        // Per-agent MCP gateway credential (rotates on update).
+        crate::mcp::wiring::inject_agent_gateway_token(&state.db, &mut env, agent_id).await;
         // Key on the agent UUID (not name) so the update re-targets the existing
         // workload instead of spawning an orphaned name-keyed duplicate (RUN-2/7).
         let mut spec = crate::agents::build_agent_spec(
@@ -928,6 +930,8 @@ pub async fn execute_agent_rollback(
         Some(agent_owner_id),
     )
     .await;
+    // Per-agent MCP gateway credential (rotates on rollback).
+    crate::mcp::wiring::inject_agent_gateway_token(&state.db, &mut env, agent_id).await;
     // `agent_versions.image_tag` for OCI-push deploys stores the registry-relative
     // `nasiko/{name}:{tag}` as-is, which pulls from docker.io if applied unqualified
     // — qualify exactly as the ad-hoc deploy and restart paths do (no-op for refs

@@ -97,7 +97,8 @@ Every table or API response that uses "connector" always carries an explicit `pr
 - **Grant** — a record that an owner has shared their connector with a specific user (by username) or with everyone on the platform.
 - **Connection** — one person's own credential/session state for a connector. Never shared, even when the connector itself is.
 - **Permission** — for a given (caller, agent, connector) triple: whether the connector is enabled for that agent at all, and whether any individual tool within it is allowed, blocked, or requires approval.
-- **Delegation token** — the short-lived, signed credential an agent presents on every call, proving "I am acting on behalf of this specific user, as this specific agent" without ever holding that user's real session credential.
+- **Agent gateway token** — the per-agent credential minted at deploy time and injected into the container env (`MCP_GATEWAY_TOKEN`); the agent presents it as a `Bearer` header on every gateway call to prove *which agent* is calling. It never names a user. MCP clients that can only be handed a URL (no header hook) can instead use the pre-composed `MCP_GATEWAY_CONNECT_URL`, which carries the same credential in the path at `POST /api/mcp/s/{token}` and is subject to identical checks — the header form is preferred where the client supports it.
+- **Flow-bound user identity** — the *for whom*: resolved server-side from the request's `traceparent`, whose trace id names the `flows` row (carrying `user_id`) that the platform wrote when it dispatched the flow to this agent. The gateway authorizes a `tools/call` only when the authenticated agent is a recorded `flow_participants` member of that flow.
 
 ---
 
@@ -115,10 +116,11 @@ flowchart TD
         AUTHMW["Session-JWT auth middleware
         (validates the user's own session)"]
         PROXY["Agent-proxy module
-        Mints a short-lived delegation token
-        whenever it forwards a request to an agent"]
-        MCPMW["Delegation-token auth middleware
-        (the only auth path for /api/mcp)"]
+        Writes the flows row + flow_participants
+        record whenever it dispatches to an agent"]
+        MCPMW["Gateway auth (in-handler)
+        Bearer MCP_GATEWAY_TOKEN → agent identity
+        traceparent → flows row → user identity"]
         MCPROUTES["MCP route handlers
         (thin — identity extraction, ACL, response shaping)"]
         LOGIC["MCP Gateway core logic
@@ -144,8 +146,8 @@ flowchart TD
 
     subgraph agents [Deployed Agents]
         A1["Agent container
-        env: MCP_GATEWAY_URL
-        forwards delegation token"]
+        env: MCP_GATEWAY_URL + MCP_GATEWAY_TOKEN
+        forwards traceparent (OTel propagation)"]
     end
 
     CLI -->|session JWT| AUTHMW
@@ -153,13 +155,13 @@ flowchart TD
     LOGIC --> RD
     LOGIC --> CO
     LOGIC --> GEN
-    PROXY -->|invoke agent + inject delegation token| A1
-    A1 -->|MCP JSON-RPC + delegation token| MCPMW
+    PROXY -->|invoke agent + traceparent| A1
+    A1 -->|"MCP JSON-RPC + Bearer token + traceparent"| MCPMW
 ```
 
 **Two request paths, both terminating in the same process:**
 
-1. **Agent runtime calls (the hot path).** Agent → the server's `/api/mcp` endpoint with its delegation token → the delegation-token middleware validates it directly and resolves identity → the MCP route handlers. This route is deliberately **not** behind the normal session-JWT middleware — an agent never holds a user's real session credential (the agent-proxy module strips `Authorization`/`Cookie` before ever forwarding a request to an agent container, specifically so an agent can never replay a user's platform credentials). The delegation token is the *only* credential this route accepts.
+1. **Agent runtime calls (the hot path).** Agent → the server's `/api/mcp` endpoint with its deploy-time `MCP_GATEWAY_TOKEN` (`Authorization: Bearer`) and the forwarded `traceparent` → the handler authenticates the agent against the stored token hash, then resolves the *user* from the flow record the traceparent names, requiring the agent to be a recorded participant of that flow. This route is deliberately **not** behind the normal session-JWT middleware — an agent never holds a user's real session credential (the agent-proxy module strips `Authorization`/`Cookie` before ever forwarding a request to an agent container, specifically so an agent can never replay a user's platform credentials).
 2. **Management / UI calls.** A person's own session JWT → the normal session-auth middleware → MCP management routes (connect, share, configure permissions, browse the catalog) — the same authentication path every other management route on the platform already uses.
 
 **The two-layer *code* split (independent of the single-process deployment above):**
@@ -198,6 +200,8 @@ mcp-gateway/                        ← pure logic crate (no AppState, no axum h
     ├── oauth.rs                    OAuth 2.1 discovery, PKCE, signed state, token exchange
     ├── webhooks.rs                 Composio webhook signature verification + processing
     ├── injector.rs                 deploy-time env-var injection (MCP_GATEWAY_URL)
+    ├── agent_tokens.rs             per-agent gateway credential: mint (rotate-on-deploy),
+    │                               hashed storage, bearer authentication, revoke-on-destroy
     └── provider/
         ├── mod.rs                  ToolProvider trait + provider registry
         ├── composio.rs              Composio v3/v3.1 HTTP client
@@ -208,15 +212,15 @@ server/                              ← the single control-plane binary — eve
     ├── auth/middleware.rs          session-JWT auth middleware (require_auth) — for every
     │                               management route, including MCP management routes
     ├── agent_proxy.rs               forwards requests to agent containers; strips the caller's
-    │                               real credentials; mints the short-lived delegation token
-    │                               for the agent to use against /api/mcp
+    │                               real credentials; writes the flows row + flow_participants
+    │                               record that binds the traceparent to (user, agent)
     └── mcp/                        ← thin MCP route layer (uses AppState, Claims, ACL)
         ├── mod.rs                  router assembly
         ├── service.rs              thin wrappers forwarding extracted identity + plain
         │                           values into the mcp-gateway crate
         └── handlers/
             ├── mod.rs              shared ApiError, identity helpers
-            ├── gateway.rs          POST /api/mcp — delegation-token auth middleware +
+            ├── gateway.rs          POST /api/mcp — bearer-token + flow-participant auth,
             │                       JSON-RPC entry point (the only route not behind require_auth)
             ├── catalog.rs          catalog + auth-config management routes
             ├── connectors.rs       MCP connector management routes
@@ -238,33 +242,40 @@ server/                              ← the single control-plane binary — eve
 
 An agent is **untrusted, user-authored code**. It is deployed once but serves requests from many different users over its lifetime. Identity therefore cannot be baked into the agent at deploy time — it must be established **per request**. And an agent must never be able to impersonate a different user, or borrow a different agent's tool permissions.
 
-### 7.2 The delegation token
+### 7.2 Two factors: agent credential + flow-bound user identity
 
-The server solves this with a short-lived, signed delegation token — an actor-pattern JWT binding two identities together: the calling user, and the acting agent. Minting and validating both happen inside the same server process, in two different modules, not across a network hop to a separate service.
+The server solves this with two independent factors that each travel for free (design rationale and security analysis: the "MCP Gateway Agent Auth" design doc):
 
-- When the server's agent-proxy module forwards a request to an agent container on a user's behalf, it mints a delegation token: `sub = user_id`, `act = agent_id`, `aud = "mcp"`, a short expiry (minutes, not hours).
-- That token is injected into the agent's inbound request as a header, and the caller's real session credential (`Authorization`, `Cookie`) is stripped before the request ever reaches the agent container — an agent can never replay a user's actual platform credentials.
-- The agent forwards this same delegation-token header when it calls the server's fixed `/api/mcp` URL.
-- A dedicated auth middleware — mounted only on that one route, replacing the normal session-JWT middleware entirely — validates the token (signature, audience, expiry) and resolves the caller's identity directly from its claims.
+- **Agent identity** — a per-agent gateway credential minted at deploy time and injected into the container env as `MCP_GATEWAY_TOKEN` (alongside `MCP_GATEWAY_URL`). Only its SHA-256 hash is stored (`agent_gateway_tokens`); the plaintext exists solely in the container env. Every redeploy rotates it; destroying the agent tombstones it. The agent configures its MCP client **once at startup** with `Authorization: Bearer $MCP_GATEWAY_TOKEN` — no per-request plumbing.
+- **User identity** — resolved server-side from the request's `traceparent`: its trace id names the `flows` row (carrying `user_id`) the platform wrote synchronously when it dispatched the flow, and the `flow_participants` record proves the flow was actually dispatched *to this agent*. The caller's real session credential (`Authorization`, `Cookie`) is still stripped before any request reaches an agent container — an agent can never replay a user's platform credentials.
+
+Authorization rules, in order, all failing **closed**:
+
+1. Bearer token missing / unknown / revoked → `401`.
+2. `tools/list` (and `initialize`/`ping`) → allowed with **agent-only** identity: read-only metadata, so agents can discover tools at startup, outside any flow.
+3. `tools/call` with no `traceparent`, an unknown trace id, or a flow no longer live → `403`. Presence is not the check — resolution is; there is nothing an agent can fabricate to pass.
+4. `tools/call` where the authenticated agent is **not** a recorded participant of the flow → `403`.
+5. Identity store unreachable → `403` — fail closed.
+6. Otherwise: resolve `user_id` from the flow record and evaluate permissions exactly as before — the intersection of the user's grants and the agent's connector access.
 
 ```mermaid
 sequenceDiagram
     participant U as User (session JWT)
-    participant S as Server — agent-proxy module
+    participant S as Server — dispatch (proxy / a2a)
     participant A as Agent Container
     participant M as Server — /api/mcp route
 
     U->>S: Invoke agent (Bearer session JWT)
     S->>S: Validate JWT, resolve user identity
-    S->>S: Mint delegation token<br/>{sub: user, act: agent, aud: mcp, short exp}
-    S->>A: Forward invocation + delegation token header<br/>(caller's real session credential stripped)
-    A->>M: POST /api/mcp (tools/list) + delegation token header
-    M->>M: Validate delegation token (aud=mcp, signature, expiry)
-    M->>M: Resolve caller identity + acting-agent identity directly from the token
-    M-->>A: Merged tool list, filtered by permissions
+    S->>S: Write flows row (user_id) + flow_participants += agent
+    S->>A: Forward invocation + traceparent<br/>(caller's real session credential stripped; no per-request token)
+    A->>M: POST /api/mcp (tools/call) + Bearer MCP_GATEWAY_TOKEN + traceparent
+    M->>M: hash(token) → agent identity (401 if unknown/revoked)
+    M->>M: traceparent → live flows row → user identity<br/>(403 unless agent ∈ flow_participants)
+    M-->>A: Result, filtered by user grants ∩ agent connector access
 ```
 
-**Why this is safe:** the token binds both principals and is signed only by the server itself — an agent cannot forge or extend it, cannot use it past its short expiry, and cannot use it for anything outside the `aud=mcp` scope. It is stateless (no database write per request), so it costs nothing at scale. And because minting and validating happen in the same process, there is no additional network boundary where the token's meaning could be misinterpreted.
+**Why this is safe:** both designs' trust root is the server asserting the (user, agent) pair at dispatch time — this one carries the assertion in server-side state only the control plane can write, instead of a bearer JWT. A leaked traceparent is useless without the agent credential; a leaked agent credential only opens `tools/list` on the agent's own grants plus `tools/call` for flows actively routed through that agent — and it is instantly revocable (tombstone the token row, or complete the flow).
 
 ### 7.3 Encryption at rest
 
@@ -695,7 +706,7 @@ Every tool call is recorded into the platform's existing observability and usage
 
 - **Usage tracking** — every successful or failed tool call is recorded with its operation type, the acting agent, latency, and outcome, feeding into the platform's existing per-user/per-agent usage reporting and cost attribution.
 - **Metrics** — tool-call counters and latency histograms carry the tool name and agent identity as attributes, consistent with the platform's broader generative-AI metrics.
-- **Distributed tracing** — trace context is propagated through the delegation-token flow so a tool call taken during a multi-agent conversation remains attributable to the originating trace.
+- **Distributed tracing** — the same `traceparent` that authorizes the call also keeps it on the originating trace, so a tool call taken during a multi-agent conversation remains attributable end to end.
 
 ---
 
@@ -722,6 +733,7 @@ No new authentication scheme is introduced for management routes — they reuse 
 | Composio base URL | Composio API endpoint | Sensible default pointing at Composio's production API |
 | Composio webhook secret | HMAC verification for the expiry webhook | Webhook processing disabled if unset |
 | Gateway public URL | Injected into every agent as `MCP_GATEWAY_URL` | Agents deployed without it cannot reach the gateway until redeployed |
+| Agent gateway token | Minted per agent at deploy, injected as `MCP_GATEWAY_TOKEN` (rotates on every redeploy) | Always minted — no configuration; a restart re-mints it |
 | Session cache TTL | How long a resolved connector/session set is cached | Short, tuned for responsiveness over cache-hit rate |
 | Permission cache TTL | How long a permission context is cached before re-checking | Short — any write-path event invalidates it immediately regardless |
 | Manifest cache TTL | How long a merged tool list is cached | Moderate — bounded by the permission/connector hash changing anyway |
@@ -730,7 +742,7 @@ No new authentication scheme is introduced for management routes — they reuse 
 
 ## 17. API Surface
 
-**Agent-facing (delegation-token identity, one endpoint):**
+**Agent-facing (bearer gateway token + flow-bound user identity, one endpoint):**
 
 | Method | Endpoint | Purpose |
 |---|---|---|

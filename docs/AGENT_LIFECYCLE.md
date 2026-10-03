@@ -150,6 +150,29 @@ Useful for CI or when you want to separate image upload from deployment:
     nasiko push .
     nasiko push . --name my-agent
 
+### Deploy from the registry
+
+Deploy an agent that is already published to an artifact registry, without
+building anything locally — the control plane pulls it itself, so no Docker
+daemon is needed on your machine:
+
+    nasiko import nasiko/my-agent:1.0.0                       # resolved against the connected registry
+    nasiko import registry.example.com/nasiko/my-agent:1.0.0  # or fully qualified
+
+The short `owner/name[:tag]` form resolves against whatever `nasiko registry
+connect` points at, the same way `nasiko new` resolves a template. The tag
+defaults to `latest`.
+
+Both packaging formats are accepted: a container image is pulled and deployed
+directly, while a source artifact is downloaded, built server-side, and then
+deployed (the command prints a `build_id` in that case — follow it with
+`nasiko logs <agent>`).
+
+The registry host must be listed in the control plane's
+`REGISTRY_IMPORT_ALLOWED_HOSTS`, otherwise the import is refused. Registries
+that require authentication are not supported yet — the server fetches
+manifests anonymously.
+
 ### Manage secrets
 
 Secrets are encrypted env vars injected into agent containers at runtime. There are two scopes:
@@ -195,6 +218,59 @@ Secrets are encrypted env vars injected into agent containers at runtime. There 
 ### Cluster health
 
     nasiko status                   # control plane health + metrics
+
+### Observability & usage attribution
+
+The control plane injects the standard `OTEL_*` environment variables into every
+deployment (collector endpoint, `OTEL_SERVICE_NAME`, GenAI capture mode) and routes your
+agent's LLM calls through its LLM gateway (`OPENAI_BASE_URL` etc.).
+
+**Forwarding `traceparent` is mandatory, not best-effort.** Every LLM call (and every
+MCP `tools/call`) must carry the W3C `traceparent` your agent received on its inbound
+A2A request — the platform resolves the calling user and the flow's budgets from it,
+and **rejects unattributable calls with `403`** rather than serving them with degraded
+billing. There is no fallback attribution.
+
+| Your agent | LLM / MCP calls served | Distributed traces | Per-user/session attribution |
+|---|---|---|---|
+| Forwards `traceparent` | ✅ | ✅ | ✅ precise (the trace id names the flow) |
+| Drops `traceparent` | ❌ `403` on every call | ❌ | — |
+
+How to forward it, per language — all driven by the injected `OTEL_*` env vars:
+
+| Language | How |
+|---|---|
+| Python | `opentelemetry-instrument python main.py`, or initialize the SDK yourself (see `oss/agents/common/telemetry.py`) |
+| Node.js | Set `NODE_OPTIONS="--require @opentelemetry/auto-instrumentations-node/register"` in your Dockerfile, with the package in your image |
+| Java | OTel javaagent: `JAVA_TOOL_OPTIONS="-javaagent:/path/to/opentelemetry-javaagent.jar"` |
+| Go | loongsuite `otel go build` in the Dockerfile (compile-time `net/http` instrumentation), or copy the manual-forwarding fallback in `oss/agents/weather` |
+| Rust | No auto-instrumentation exists — initialize the OTel SDK in code and inject the header explicitly (see the Rust agents' `telemetry.rs`) |
+
+Minimum: extract `traceparent` from your **inbound HTTP server** and inject it on your
+**outbound LLM/MCP clients**. Token counts themselves come from the LLM provider's
+response — no GenAI-specific instrumentors are required.
+
+### Tools via the MCP gateway
+
+Every deployment also receives the platform's tool layer, configured entirely by env:
+
+- `MCP_GATEWAY_URL` — the gateway's single JSON-RPC endpoint (when the platform has one configured)
+- `MCP_GATEWAY_TOKEN` — your agent's own credential, minted fresh on every deploy
+
+Configure your MCP client **once at startup** — there is no per-request credential:
+
+```python
+mcp = McpClient(
+    url=os.environ["MCP_GATEWAY_URL"],
+    headers={"Authorization": f"Bearer {os.environ['MCP_GATEWAY_TOKEN']}"},
+)
+```
+
+`tools/list` works immediately (agent-only identity — use it for startup discovery).
+`tools/call` is authorized per flow: the gateway resolves the calling user from your
+forwarded `traceparent` and requires that the flow was actually dispatched to your
+agent, so the same OTel propagation above is all you need. The Go reference
+implementation is `oss/agents/weather` (`mcp.go`).
 
 ---
 
@@ -254,6 +330,23 @@ Changed secrets only — restart to pick them up (no rebuild):
     nasiko secrets set NEW_KEY value --agent my-agent
     nasiko restart my-agent
 
+Published a new version to the registry — re-run the import with the new tag:
+
+    nasiko import nasiko/my-agent:1.0.1
+
+This updates the agent in place rather than creating a second one: it matches
+on owner + name, so the agent keeps its id, and its grants, ACLs, and stored
+secrets survive. The control plane re-pulls the image and recreates the
+container.
+
+Prefer bumping the tag. Re-publishing the *same* tag also works — the pull
+compares digests and the container is recreated either way — but the recorded
+version no longer identifies which build is running.
+
+Note that `nasiko restart` does **not** fetch a new image; it recreates the
+container from what the cluster already has. Only `deploy` and `import` bring
+in new code.
+
 ---
 
 ## Local cluster workflow
@@ -300,6 +393,7 @@ Test the full deploy flow locally before pushing to production:
 - `nasiko up` / `nasiko down` — Start/stop local cluster
 - `nasiko deploy .` — Build + push + deploy
 - `nasiko push .` — Push image only
+- `nasiko import <ref>` — Deploy from a registry reference (server pulls it)
 - `nasiko secrets set <key> <value>` — Store secret (vault or `--agent`)
 
 **Operate**

@@ -110,10 +110,7 @@ impl InboundParser for AnthropicInbound {
             "stop_sequence": Value::Null,
         });
         if let Some(u) = usage {
-            out["usage"] = json!({
-                "input_tokens": u.prompt_tokens.unwrap_or(0),
-                "output_tokens": u.completion_tokens.unwrap_or(0),
-            });
+            out["usage"] = anthropic_usage(u);
         }
         out
     }
@@ -286,21 +283,41 @@ enum OpenBlock {
     Tool(i64),
 }
 
+fn anthropic_usage(mut usage: crate::ir::Usage) -> Value {
+    usage.normalize_openai_details();
+    let mut value = json!({});
+    for (key, count) in [
+        ("input_tokens", usage.prompt_tokens),
+        ("output_tokens", usage.completion_tokens),
+        ("cache_read_input_tokens", usage.cache_read_input_tokens),
+        (
+            "cache_creation_input_tokens",
+            usage.cache_creation_input_tokens,
+        ),
+    ] {
+        if let Some(count) = count {
+            value[key] = json!(count);
+        }
+    }
+    if let Some(cache) = usage.cache_creation {
+        value["cache_creation"] = json!(cache);
+    }
+    value
+}
+
 /// Reconstructs Anthropic's stateful event sequence from flat OpenAI-shaped IR chunks.
 ///
 /// Anthropic indexes content blocks sequentially across both text and tool blocks; the
 /// IR carries tool deltas with their own (tool-only) index. We assign Anthropic block
-/// indices as blocks open and map the IR tool index onto them. `input_tokens` is only
-/// known at the end of the IR stream (terminal usage chunk), so `message_start` reports
-/// what we have so far (usually 0) — a known minor fidelity gap; `output_tokens` is
-/// reported faithfully in `message_delta`.
+/// indices as blocks open and map the IR tool index onto them. Usage arriving after
+/// message_start is sent in message_delta so clients can update their final message
+/// without delaying incremental text or tool delivery.
 #[derive(Default)]
 struct AnthropicStreamRenderer {
     started: bool,
     id: String,
     model: String,
-    input_tokens: i64,
-    output_tokens: i64,
+    usage: crate::ir::Usage,
     stop_reason: Option<String>,
     open_block: Option<OpenBlock>,
     next_index: i64,
@@ -320,7 +337,12 @@ impl AnthropicStreamRenderer {
                     "content": [],
                     "stop_reason": Value::Null,
                     "stop_sequence": Value::Null,
-                    "usage": { "input_tokens": self.input_tokens, "output_tokens": 0 },
+                    // Required start counts are provisional; terminal usage replaces them.
+                    "usage": anthropic_usage(crate::ir::Usage {
+                        prompt_tokens: Some(self.usage.prompt_tokens.unwrap_or(0)),
+                        completion_tokens: Some(0),
+                        ..self.usage.clone()
+                    }),
                 }
             }),
         )
@@ -354,12 +376,24 @@ impl ChatStreamRenderer for AnthropicStreamRenderer {
     fn render(&mut self, chunk: ChatChunk) -> Vec<String> {
         let mut out = Vec::new();
 
-        if let Some(u) = &chunk.usage {
-            if let Some(i) = u.prompt_tokens {
-                self.input_tokens = i;
-            }
-            if let Some(o) = u.completion_tokens {
-                self.output_tokens = o;
+        if let Some(mut usage) = chunk.usage {
+            usage.normalize_openai_details();
+            self.usage.prompt_tokens = usage.prompt_tokens.or(self.usage.prompt_tokens);
+            self.usage.completion_tokens = usage.completion_tokens.or(self.usage.completion_tokens);
+            self.usage.cache_read_input_tokens = usage
+                .cache_read_input_tokens
+                .or(self.usage.cache_read_input_tokens);
+            self.usage.cache_creation_input_tokens = usage
+                .cache_creation_input_tokens
+                .or(self.usage.cache_creation_input_tokens);
+            if let Some(cache) = usage.cache_creation {
+                let current = self.usage.cache_creation.get_or_insert_default();
+                current.ephemeral_5m_input_tokens = cache
+                    .ephemeral_5m_input_tokens
+                    .or(current.ephemeral_5m_input_tokens);
+                current.ephemeral_1h_input_tokens = cache
+                    .ephemeral_1h_input_tokens
+                    .or(current.ephemeral_1h_input_tokens);
             }
         }
 
@@ -447,7 +481,7 @@ impl ChatStreamRenderer for AnthropicStreamRenderer {
             "message_delta",
             json!({
                 "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
-                "usage": { "output_tokens": self.output_tokens },
+                "usage": anthropic_usage(self.usage.clone()),
             }),
         ));
         out.push(event("message_stop", json!({})));
@@ -616,6 +650,63 @@ mod tests {
             usage: None,
             extra: Map::new(),
         }
+    }
+
+    #[test]
+    fn terminal_usage_preserves_input_cache_and_ttl_without_buffering_text() {
+        let mut renderer = AnthropicInbound.chat_stream_renderer();
+        assert!(
+            renderer
+                .render(text_chunk("hello"))
+                .join("")
+                .contains("text_delta")
+        );
+        let usage: crate::ir::Usage = serde_json::from_value(json!({
+            "prompt_tokens":2,"completion_tokens":10,"cache_read_input_tokens":1000,
+            "cache_creation_input_tokens":300,
+            "cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":200}
+        }))
+        .unwrap();
+        let mut chunk = text_chunk("");
+        chunk.usage = Some(usage.clone());
+        renderer.render(chunk.clone());
+        renderer.render(chunk);
+        let mut partial = text_chunk("");
+        partial.usage = Some(crate::ir::Usage {
+            completion_tokens: Some(0),
+            ..Default::default()
+        });
+        renderer.render(partial);
+        let frames = renderer.finish();
+        let delta: Value = serde_json::from_str(
+            frames
+                .iter()
+                .find(|f| f.contains("event: message_delta"))
+                .unwrap()
+                .lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        let mut expected = anthropic_usage(usage);
+        expected["output_tokens"] = json!(0);
+        assert_eq!(delta["usage"], expected);
+        assert!(
+            !delta["usage"]
+                .as_object()
+                .unwrap()
+                .contains_key("total_tokens")
+        );
+    }
+
+    #[test]
+    fn buffered_usage_normalizes_nested_cache_and_retains_missing_fields() {
+        let usage = serde_json::from_value(json!({"prompt_tokens":110,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":100}})).unwrap();
+        let result = anthropic_usage(usage);
+        assert_eq!(result["input_tokens"], 10);
+        assert_eq!(result["cache_read_input_tokens"], 100);
+        assert!(result.get("cache_creation_input_tokens").is_none());
+        assert_eq!(anthropic_usage(crate::ir::Usage::default()), json!({}));
     }
 
     #[test]

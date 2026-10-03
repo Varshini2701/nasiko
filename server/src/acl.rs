@@ -190,9 +190,11 @@ impl CallGuard for CpCallGuard {
         Box::pin(async move {
             let ctx = self.flow_ctx.lock().await;
 
+            let target_id = resolve_agent_id(&self.db, &target).await;
+
             // ACL check: if the caller has an allowlist, verify target is in it
             if let Some(caller_id) = self.caller_agent_id {
-                let target_id = resolve_agent_id(&self.db, &target).await?;
+                let target_id = *target_id.as_ref().map_err(Clone::clone)?;
                 let allowed = check_agent_acl(&self.db, caller_id, target_id)
                     .await
                     .map_err(|e| {
@@ -214,6 +216,19 @@ impl CallGuard for CpCallGuard {
 
             if let Err(rejection) = self.flow_guard.record_invocation(&ctx, &target).await {
                 return Err(rejection.to_string());
+            }
+
+            // The call is going ahead — record the target as a flow participant
+            // (orchestrator cascade legs have no `flows`-insert of their own).
+            // Load-bearing for MCP gateway / LLM router authorization; an
+            // unresolvable target only skips the record (its own gateway calls
+            // will then be denied), it never blocks the A2A call itself.
+            match target_id {
+                Ok(id) => crate::flows::record_participant(&self.db, &ctx.flow_id, id).await,
+                Err(e) => warn!(
+                    %e, target = %target, flow_id = %ctx.flow_id,
+                    "flow participant not recorded: target agent unresolved"
+                ),
             }
 
             Ok(())

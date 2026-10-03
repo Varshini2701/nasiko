@@ -258,6 +258,7 @@ pub(crate) fn trace_payload(event: &CodingAgentEventV1) -> Value {
         let mut attributes = common_attributes(event);
         attributes.extend([
             string_attr("gen_ai.operation.name", "chat"),
+            string_attr("nasiko.usage.prompt_convention", "exclusive"),
             string_attr("gen_ai.system", &call.provider),
             string_attr("gen_ai.provider.name", &call.provider),
             string_attr("gen_ai.request.model", &call.model),
@@ -273,6 +274,43 @@ pub(crate) fn trace_payload(event: &CodingAgentEventV1) -> Value {
                 call.cache_creation_tokens,
             ),
         ]);
+        if let Some(accounting) = &call.accounting {
+            for (key, value) in [
+                (
+                    "nasiko.usage.cache_creation_5m_tokens",
+                    accounting.cache_creation_5m_tokens,
+                ),
+                (
+                    "nasiko.usage.cache_creation_1h_tokens",
+                    accounting.cache_creation_1h_tokens,
+                ),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(int_attr(key, value));
+                }
+            }
+            for (key, value) in [
+                ("nasiko.usage.speed", accounting.speed.as_deref()),
+                (
+                    "nasiko.usage.service_tier",
+                    accounting.service_tier.as_deref(),
+                ),
+                (
+                    "nasiko.usage.inference_geo",
+                    accounting.inference_geo.as_deref(),
+                ),
+                ("nasiko.usage.request_id", accounting.request_id.as_deref()),
+                ("nasiko.usage.message_id", accounting.message_id.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(string_attr(key, value));
+                }
+            }
+            attributes.push(bool_attr(
+                "nasiko.usage.conflicting_observations",
+                accounting.conflicting_observations,
+            ));
+        }
         span(
             &trace_id,
             &scoped_id(
@@ -610,6 +648,7 @@ mod tests {
             session: CodingAgentSession {
                 id: coding_agent_session_id("claude", "session"),
                 source_id: "session".into(),
+                title: None,
             },
             turn: CodingAgentTurn {
                 id: "turn".into(),
@@ -627,6 +666,7 @@ mod tests {
                         output_tokens: 3,
                         cache_read_tokens: 5,
                         cache_creation_tokens: 7,
+                        accounting: None,
                         started_at: start,
                         ended_at: end,
                     })
@@ -672,6 +712,30 @@ mod tests {
     }
 
     #[test]
+    fn emitted_usage_round_trips_without_subtracting_cache_twice() {
+        let mut event = event(CapturePolicy::Content);
+        event.turn.llm_calls[0].input_tokens = 100;
+        let payload = trace_payload(&event);
+        for (span, call) in spans(&payload).iter().skip(1).zip(&event.turn.llm_calls) {
+            let attributes = span["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|attr| {
+                    let value = &attr["value"];
+                    let decoded = value.get("intValue").or_else(|| value.get("stringValue"))?;
+                    Some((attr["key"].as_str().unwrap().to_owned(), decoded.clone()))
+                })
+                .collect();
+            let usage = nasiko_observability::extract_usage_attrs(&attributes);
+            assert_eq!(usage.input, call.input_tokens);
+            assert_eq!(usage.output, call.output_tokens);
+            assert_eq!(usage.cache_read, call.cache_read_tokens);
+            assert_eq!(usage.cache_creation, call.cache_creation_tokens);
+        }
+    }
+
+    #[test]
     fn content_policy_controls_only_trace_content() {
         let content = trace_payload(&event(CapturePolicy::Content));
         assert_eq!(
@@ -699,6 +763,16 @@ mod tests {
         let encoded = serde_json::to_string(&log).unwrap();
         assert!(!encoded.contains("prompt"));
         assert!(!encoded.contains("response"));
+    }
+
+    #[test]
+    fn session_titles_do_not_change_otlp_payloads_or_trace_identity() {
+        let mut event = event(CapturePolicy::Content);
+        let trace = trace_payload(&event);
+        let logs = log_payload(&event);
+        event.session.title = Some("Private external session title".into());
+        assert_eq!(trace_payload(&event), trace);
+        assert_eq!(log_payload(&event), logs);
     }
 
     #[test]

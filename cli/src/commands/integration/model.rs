@@ -15,6 +15,7 @@ pub struct LlmCall {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    pub accounting: Option<nasiko_types::CodingAgentCallAccounting>,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
 }
@@ -57,5 +58,6 @@ impl Turn {
 #[derive(Debug)]
 pub struct SessionSnapshot {
     pub session_id: String,
+    pub title: Option<String>,
     pub turns: Vec<Turn>,
 }

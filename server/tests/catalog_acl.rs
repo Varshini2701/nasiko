@@ -418,6 +418,53 @@ async fn list_includes_public_agent_for_non_owner() {
 
 #[tokio::test]
 #[serial]
+async fn list_excludes_internal_agent_even_for_superuser() {
+    let server = common::TestServer::start().await;
+    let admin = init_admin(&server).await;
+    let uid = admin["user_id"].as_str().unwrap();
+
+    let internal = create_agent(
+        &server,
+        uid,
+        json!({"name": "cat3-internal-hidden", "version": "1.0.0"}),
+    )
+    .await;
+    let internal_id = internal["id"].as_str().unwrap();
+    // Public too — proves the exclusion applies regardless of access rules,
+    // not just because it would otherwise have been invisible. `is_internal`
+    // isn't exposed through the create/update API by design (an ordinary
+    // metadata edit must never be able to flip it), so it's set directly.
+    sqlx::query("UPDATE agents SET is_public = true, is_internal = true WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(internal_id).unwrap())
+        .execute(&server.db)
+        .await
+        .unwrap();
+
+    let normal = create_agent(
+        &server,
+        uid,
+        json!({"name": "cat3-internal-normal", "version": "1.0.0"}),
+    )
+    .await;
+    let normal_id = normal["id"].as_str().unwrap();
+
+    let seen = list_agents(&server, uid, true).await;
+    let ids: Vec<&str> = seen.iter().filter_map(|a| a["id"].as_str()).collect();
+
+    assert!(
+        !ids.contains(&internal_id),
+        "an internal agent must not appear in the list, even for a superuser"
+    );
+    assert!(
+        ids.contains(&normal_id),
+        "an ordinary agent's visibility must be unaffected"
+    );
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn by_skill_includes_user_granted_agent_for_non_owner() {
     let server = common::TestServer::start().await;
     let admin = init_admin(&server).await;
@@ -461,6 +508,41 @@ async fn by_skill_includes_user_granted_agent_for_non_owner() {
     assert!(
         !ids.contains(&ungranted_id),
         "non-owner must not see a non-granted agent via by-skill"
+    );
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn by_skill_excludes_internal_agent_even_with_a_matching_skill_tag() {
+    let server = common::TestServer::start().await;
+    let admin = init_admin(&server).await;
+    let uid = admin["user_id"].as_str().unwrap();
+
+    let internal = create_agent(
+        &server,
+        uid,
+        json!({
+            "name": "cat3-skill-internal",
+            "version": "1.0.0",
+            "skills": [skill("cat3-s3", &["cat3-internal-skill-tag"])],
+        }),
+    )
+    .await;
+    let internal_id = internal["id"].as_str().unwrap();
+    sqlx::query("UPDATE agents SET is_public = true, is_internal = true WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(internal_id).unwrap())
+        .execute(&server.db)
+        .await
+        .unwrap();
+
+    let seen = by_skill(&server, uid, true, "cat3-internal-skill-tag").await;
+    let ids: Vec<&str> = seen.iter().filter_map(|a| a["id"].as_str()).collect();
+
+    assert!(
+        !ids.contains(&internal_id),
+        "an internal agent must not appear via by-skill, even for a superuser, even with a matching skill tag"
     );
 
     server.cleanup().await;
@@ -691,6 +773,86 @@ async fn public_agent_non_owner_can_read_but_not_mutate() {
         403,
         "non-owner must NOT update a public agent"
     );
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn coding_agent_registration_is_server_managed_idempotent_and_conflict_safe() {
+    let server = common::TestServer::start().await;
+    let admin = init_admin(&server).await;
+    let admin_id = admin["user_id"].as_str().unwrap();
+
+    let generic = create_agent(
+        &server,
+        admin_id,
+        json!({
+            "name": "admin-claude-code",
+            "metadata": {"source": "nasiko-cli-integration", "integration_id": "claude"}
+        }),
+    )
+    .await;
+    let generic_id = generic["id"].as_str().unwrap();
+    let generic_detail = get_agent(&server, admin_id, true, generic_id)
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(generic_detail["data"]["is_coding_agent"], false);
+    assert!(generic_detail["data"]["coding_agent_integration_id"].is_null());
+
+    let conflict = common::as_superuser(
+        server
+            .client
+            .post(server.url("/api/agents/coding-integrations")),
+        admin_id,
+        "admin",
+    )
+    .json(&json!({"integration_id": "claude"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(conflict.status(), 409);
+
+    let alice = create_user(&server, admin_id, "Alice_Example").await;
+    let alice_id = alice["id"].as_str().unwrap();
+    let register = || {
+        common::as_member(
+            server
+                .client
+                .post(server.url("/api/agents/coding-integrations")),
+            alice_id,
+            "Alice_Example",
+        )
+        .json(&json!({"integration_id": "claude"}))
+        .send()
+    };
+    let first = register().await.unwrap();
+    assert_eq!(first.status(), 201);
+    let first: Value = first.json().await.unwrap();
+    assert_eq!(first["name"], "alice-example-claude-code");
+    assert_eq!(first["coding_agent_integration_id"], "claude");
+    assert_eq!(first["created"], true);
+
+    let second = register().await.unwrap();
+    assert_eq!(second.status(), 200);
+    let second: Value = second.json().await.unwrap();
+    assert_eq!(second["id"], first["id"]);
+    assert_eq!(second["created"], false);
+
+    let unsupported = common::as_member(
+        server
+            .client
+            .post(server.url("/api/agents/coding-integrations")),
+        alice_id,
+        "Alice_Example",
+    )
+    .json(&json!({"integration_id": "unknown"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(unsupported.status(), 400);
 
     server.cleanup().await;
 }

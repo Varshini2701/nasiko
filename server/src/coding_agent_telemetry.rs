@@ -18,6 +18,8 @@ use crate::chat::models::{ExternalTurn, MessageUsage};
 use crate::mcp::ApiResponse;
 use crate::state::AppState;
 
+const CODING_SESSION_PLACEHOLDER: &str = "Coding session";
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/telemetry/coding-agent/events/batch", post(ingest_batch))
@@ -101,6 +103,13 @@ async fn process_event(
         ));
     }
 
+    // Pricing acquires its own database connection. Do not hold the write
+    // transaction while looking up rates: a saturated pool would deadlock.
+    let cost = if event.capture_policy == CapturePolicy::Content {
+        price_turn(&state.pricing, event).await
+    } else {
+        None
+    };
     let mut tx = state.db.begin().await?;
     let agent_id: Option<Uuid> = sqlx::query_scalar(
         r#"SELECT id FROM agents
@@ -124,12 +133,19 @@ async fn process_event(
     sqlx::query(
         r#"INSERT INTO chat_sessions
               (session_id, user_id, agent_id, title, created_at, updated_at)
-           VALUES ($1, $2, $3, 'Coding session', $4, $5)
+           VALUES ($1, $2, $3, $4, $5, $6)
            ON CONFLICT (session_id) DO NOTHING"#,
     )
     .bind(&server_session_id)
     .bind(user_id)
     .bind(agent_id)
+    .bind(
+        event
+            .session
+            .title
+            .as_deref()
+            .unwrap_or(CODING_SESSION_PLACEHOLDER),
+    )
     .bind(event.turn.started_at)
     .bind(event.turn.ended_at)
     .execute(&mut *tx)
@@ -191,8 +207,28 @@ async fn process_event(
         return Ok(CodingAgentEventStatus::Duplicate);
     }
 
+    // Replays must never rename a session; only newly accepted receipts can upgrade it.
+    if let Some(title) = &event.session.title {
+        sqlx::query(
+            r#"UPDATE chat_sessions SET title = $4
+               WHERE session_id = $1 AND user_id = $2 AND agent_id = $3
+                 AND deleted_at IS NULL AND title = $5"#,
+        )
+        .bind(&server_session_id)
+        .bind(user_id)
+        .bind(agent_id)
+        .bind(title)
+        .bind(CODING_SESSION_PLACEHOLDER)
+        .execute(&mut *tx)
+        .await?;
+    }
+
     if event.capture_policy == CapturePolicy::Content {
-        let turn = external_turn(event, &server_session_id);
+        let mut turn = external_turn(event, &server_session_id);
+        if let (Some(usage), Some((cost, estimated))) = (turn.assistant_usage.as_mut(), cost) {
+            usage.cost_usd = Some(cost);
+            usage.estimated = Some(estimated);
+        }
         persist_external_turn(
             &mut tx,
             &server_session_id,
@@ -228,15 +264,89 @@ fn scoped_session_id(agent_id: Uuid, source_session_id: &str) -> String {
     .to_string()
 }
 
+/// Cost the turn through the platform's pricing engine.
+///
+/// Coding-agent turns carried no cost at all, so a session that spent hundreds
+/// of dollars showed a blank in the chat view while the observability page,
+/// pricing the same spans, showed the real figure. The counts here are the
+/// agent's own and exact, so this is a lookup rather than an estimate.
+///
+/// Priced per call rather than per turn: a turn can switch models mid-way (a
+/// sub-agent on a cheaper tier), and pricing the summed tokens against one
+/// model's rate would charge the whole turn at whichever model happened to be
+/// reported. Failure is non-fatal — an unpriced turn is worth keeping.
+async fn price_turn(
+    pricing: &nasiko_pricing::PricingEngine,
+    event: &CodingAgentEventV1,
+) -> Option<(rust_decimal::Decimal, bool)> {
+    if event.turn.llm_calls.is_empty() {
+        return None;
+    }
+    let mut total = nasiko_pricing::CostBreakdown::default();
+    for call in &event.turn.llm_calls {
+        let context = call
+            .accounting
+            .as_ref()
+            .map(|a| nasiko_pricing::PricingContext {
+                cache_creation_5m: a.cache_creation_5m_tokens,
+                cache_creation_1h: a.cache_creation_1h_tokens,
+                speed: a.speed.as_deref(),
+                service_tier: a.service_tier.as_deref(),
+                inference_geo: a.inference_geo.as_deref(),
+                conflicting_observations: a.conflicting_observations,
+            })
+            .unwrap_or_default();
+        let priced = pricing
+            .price_with_context(
+                Some(&call.provider),
+                &call.model,
+                nasiko_pricing::RawUsage {
+                    input: call.input_tokens,
+                    output: call.output_tokens,
+                    cache_read: call.cache_read_tokens,
+                    cache_creation: call.cache_creation_tokens,
+                    total: None,
+                },
+                // Coding-agent transcripts report the prompt disjoint from the
+                // cache counts, which is Anthropic's convention and what the
+                // adapters normalize the others to.
+                nasiko_pricing::PromptConvention::Exclusive,
+                call.started_at,
+                context,
+            )
+            .await;
+        total.add(priced.cost);
+    }
+    // Retain legitimate zero costs and round to the engine's micro-dollar precision.
+    let cost = rust_decimal::Decimal::from_f64_retain(total.total_usd)?;
+    Some((cost.round_dp(6), total.estimated))
+}
+
+/// `chat_messages` usage columns are `INTEGER`; a long coding-agent session can
+/// exceed that in cache reads alone (one real transcript reported 187M), so the
+/// conversion saturates rather than wrapping to a negative count.
+fn saturating_i32(value: u64) -> i32 {
+    value.min(i32::MAX as u64) as i32
+}
+
 fn external_turn(event: &CodingAgentEventV1, session_id: &str) -> ExternalTurn {
     let mut scoped_event = event.clone();
     scoped_event.session.id = session_id.to_string();
     let calls = &event.turn.llm_calls;
-    let input_tokens = calls.iter().fold(0_u64, |total, call| {
-        total
-            .saturating_add(call.input_tokens)
-            .saturating_add(call.cache_read_tokens)
-            .saturating_add(call.cache_creation_tokens)
+    // The four classes are kept apart. Folding the cached counts into `input`
+    // — which is what this did — loses the only information that explains why a
+    // turn was cheap, and leaves the chat view reporting a whole prompt as if
+    // every token of it were fresh. The agents report the split exactly (an
+    // Anthropic transcript carries `cache_read_input_tokens` per call), so
+    // there is nothing to infer here.
+    let input_tokens = calls
+        .iter()
+        .fold(0_u64, |total, call| total.saturating_add(call.input_tokens));
+    let cache_read_tokens = calls.iter().fold(0_u64, |total, call| {
+        total.saturating_add(call.cache_read_tokens)
+    });
+    let cache_creation_tokens = calls.iter().fold(0_u64, |total, call| {
+        total.saturating_add(call.cache_creation_tokens)
     });
     let output_tokens = calls.iter().fold(0_u64, |total, call| {
         total.saturating_add(call.output_tokens)
@@ -260,10 +370,16 @@ fn external_turn(event: &CodingAgentEventV1, session_id: &str) -> ExternalTurn {
             .clone()
             .expect("content event validated"),
         assistant_usage: Some(MessageUsage {
-            input_tokens: Some(input_tokens.min(i32::MAX as u64) as i32),
-            output_tokens: Some(output_tokens.min(i32::MAX as u64) as i32),
+            input_tokens: Some(saturating_i32(input_tokens)),
+            output_tokens: Some(saturating_i32(output_tokens)),
+            cache_read_tokens: Some(saturating_i32(cache_read_tokens)),
+            cache_creation_tokens: Some(saturating_i32(cache_creation_tokens)),
             model,
             duration_ms: Some(duration_ms.min(i32::MAX as i64) as i32),
+            // Filled in by the caller, which holds the pricing engine. Left
+            // `None` here rather than zero: a coding-agent turn showing no cost
+            // at all is what this used to do, and zero would be worse — it
+            // reads as "this turn was free" instead of "not priced yet".
             cost_usd: None,
             estimated: None,
             trace_id: Some(crate::coding_agent_otlp::trace_id_for_event(&scoped_event)),
@@ -275,5 +391,129 @@ fn external_turn(event: &CodingAgentEventV1, session_id: &str) -> ExternalTurn {
                 "tool_calls": event.turn.tool_calls,
             }),
         )])),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nasiko_types::{
+        CODING_AGENT_EVENT_VERSION, CodingAgentLlmCall, CodingAgentSession, CodingAgentSource,
+        CodingAgentTurn,
+    };
+
+    fn event() -> CodingAgentEventV1 {
+        let at = chrono::Utc::now();
+        CodingAgentEventV1 {
+            version: CODING_AGENT_EVENT_VERSION,
+            event_id: "event".into(),
+            captured_at: at,
+            source: CodingAgentSource {
+                agent_id: "claude".into(),
+                agent_name: "coding-agent".into(),
+            },
+            session: CodingAgentSession {
+                id: "session".into(),
+                source_id: "source-session".into(),
+                title: None,
+            },
+            turn: CodingAgentTurn {
+                id: "turn".into(),
+                prompt: Some("question".into()),
+                response: Some("answer".into()),
+                started_at: at,
+                ended_at: at,
+                llm_calls: ["gpt-4o", "gpt-4o-mini"]
+                    .into_iter()
+                    .map(|model| CodingAgentLlmCall {
+                        id: model.into(),
+                        model: model.into(),
+                        provider: "openai".into(),
+                        input_tokens: 1000,
+                        output_tokens: 500,
+                        cache_read_tokens: 2000,
+                        cache_creation_tokens: 100,
+                        accounting: None,
+                        started_at: at,
+                        ended_at: at,
+                    })
+                    .collect(),
+                tool_calls: vec![],
+            },
+            capture_policy: CapturePolicy::Content,
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_model_turns_keep_four_classes_and_sum_each_calls_cost() {
+        let event = event();
+        let pricing = nasiko_pricing::PricingEngine::offline();
+        let turn = external_turn(&event, "scoped-session");
+        let (cost, estimated) = price_turn(&pricing, &event).await.unwrap();
+        let usage = turn.assistant_usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(2000));
+        assert_eq!(usage.output_tokens, Some(1000));
+        assert_eq!(usage.cache_read_tokens, Some(4000));
+        assert_eq!(usage.cache_creation_tokens, Some(200));
+        let mut expected = nasiko_pricing::CostBreakdown::default();
+        for call in &event.turn.llm_calls {
+            expected.add(
+                pricing
+                    .price(
+                        Some(&call.provider),
+                        &call.model,
+                        nasiko_pricing::RawUsage {
+                            input: call.input_tokens,
+                            output: call.output_tokens,
+                            cache_read: call.cache_read_tokens,
+                            cache_creation: call.cache_creation_tokens,
+                            total: None,
+                        },
+                        nasiko_pricing::PromptConvention::Exclusive,
+                        call.started_at,
+                    )
+                    .await
+                    .cost,
+            );
+        }
+        assert_eq!(
+            cost,
+            rust_decimal::Decimal::from_f64_retain(expected.total_usd)
+                .unwrap()
+                .round_dp(6)
+        );
+        assert_eq!(estimated, expected.estimated);
+    }
+
+    #[tokio::test]
+    async fn absent_calls_are_unpriced_but_reported_zero_usage_is_zero_cost() {
+        let pricing = nasiko_pricing::PricingEngine::offline();
+        let mut event = event();
+        for call in &mut event.turn.llm_calls {
+            call.input_tokens = 0;
+            call.output_tokens = 0;
+            call.cache_read_tokens = 0;
+            call.cache_creation_tokens = 0;
+        }
+        assert_eq!(
+            price_turn(&pricing, &event).await.unwrap().0,
+            rust_decimal::Decimal::ZERO
+        );
+        event.turn.llm_calls.clear();
+        assert_eq!(price_turn(&pricing, &event).await, None);
+    }
+
+    #[test]
+    fn oversized_transcript_counts_saturate_instead_of_wrapping() {
+        let mut event = event();
+        for call in &mut event.turn.llm_calls {
+            call.input_tokens = u64::MAX;
+            call.cache_read_tokens = u64::MAX;
+        }
+        let usage = external_turn(&event, "scoped-session")
+            .assistant_usage
+            .unwrap();
+        assert_eq!(usage.input_tokens, Some(i32::MAX));
+        assert_eq!(usage.cache_read_tokens, Some(i32::MAX));
     }
 }

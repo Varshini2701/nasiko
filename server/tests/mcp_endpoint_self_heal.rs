@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
-use nasiko_auth::jwt::mint_delegation_token;
 use nasiko_mcp_gateway::types::connector_prefix;
 use nasiko_runtime::{ContainerRuntime, DockerRuntime, DockerRuntimeConfig};
 use nasiko_server::mcp::build::{BuildSource, execute_mcp_server_build};
@@ -184,18 +183,15 @@ async fn stale_stored_endpoint_self_heals_on_the_next_tool_call() {
         .await
         .unwrap();
 
-    let token = mint_delegation_token(
-        common::TEST_JWT_SECRET,
-        &owner_id.to_string(),
-        &agent_id.to_string(),
-    )
-    .expect("mint delegation token");
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+    let (_flow_id, traceparent) = common::open_flow(&server.db, owner_id, agent_id).await;
     let tool = format!("{}__echo", connector_prefix(connector_id));
 
     let res = server
         .client
         .post(server.url("/api/mcp"))
-        .header("x-nasiko-agent-token", &token)
+        .bearer_auth(&token)
+        .header("traceparent", &traceparent)
         .json(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": tool, "arguments": {"message": "hello"}},

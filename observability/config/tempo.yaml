@@ -17,13 +17,14 @@ ingester:
 
 compactor:
   compaction:
-    block_retention: 24h
+    block_retention: 744h   # 31 days — covers the 30d TokenOps filter
 
 storage:
   trace:
     backend: local
     wal:
       path: /var/tempo/wal
+      ingestion_time_range_slack: 360h   # allow backfilled traces up to 15 days old
     local:
       path: /var/tempo/blocks
 

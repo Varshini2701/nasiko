@@ -46,3 +46,22 @@ pub async fn require_superuser(req: Request, next: Next) -> Response {
         None => (StatusCode::UNAUTHORIZED, "not authenticated").into_response(),
     }
 }
+
+/// Gates user management routes: admin role or superuser.
+pub async fn require_user_manager(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    match req.extensions().get::<Claims>() {
+        Some(claims) => {
+            let identity = claims.clone().into();
+            if state.auth.can_manage_users(&identity).await {
+                next.run(req).await
+            } else {
+                (StatusCode::FORBIDDEN, "requires admin role").into_response()
+            }
+        }
+        None => (StatusCode::UNAUTHORIZED, "not authenticated").into_response(),
+    }
+}

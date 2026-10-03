@@ -6,11 +6,6 @@ __pycache__/
 .env.*
 *.env.toml
 !.env.example
-# The Flutter app bundles its release dotenv file as a browser-served asset
-# (public URLs/tuning only — the import script scans it for credentials).
-# Deliberately NOT negating .env.* : the import script prunes non-release
-# flavors, and this makes an accidental re-import of one fail its ignore-check.
-!ee/ui/app/assets/.env
 .venv/
 node_modules/
 *.egg-info/
@@ -28,6 +23,15 @@ uv.lock
 *.swo
 .envrc
 
+# Claude Code. Only the personal half — settings.local.json is per-developer
+# permissions and holds absolute paths from whoever's machine wrote it, so it
+# is never shareable. The rest of .claude/ is: settings.json, skills/, agents/
+# and commands/ are team config and should be committed when someone adds one
+# (.claude/skills/backend-ui-slice is already scaffolded). Same split as
+# .vscode/settings.json above — ignore the personal file, not the tool's
+# directory, or the shared half can never land.
+.claude/settings.local.json
+
 
 # Local MCP config — contains a registry credential, do not commit
 .mcp.json
@@ -39,3 +43,17 @@ values.json
 /docs/MCP_SERVER_UPLOAD_EE_IMPLEMENTATION_PLAN.md
 /docs/MCP_UPLOAD_PLAN_OSS.md
 .preview-shots/
+/_to_delete/
+# The same holder, anywhere. The Cowork device mount cannot unlink, so a file
+# that has to go gets moved into one of these instead of deleted; a stray one
+# under ui/ was otherwise an untracked directory in every status.
+_to_delete/
+/_xfer/
+# Recorded eval runs (ui/scripts/eval-generations.mjs --record). One directory
+# per run, kept so a baseline is never lost again — experiment output, not
+# source, and it accumulates. To keep one durably, `git add -f` it or copy it
+# out; `--compare` takes any directory of .dsl files.
+ui/tests/fixtures/runs/
+
+# Private React/Next migration workspace; do not force-add before release approval.
+/react/

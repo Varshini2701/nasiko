@@ -3,15 +3,19 @@ resolver = "3"
 members = [
     # ─── OSS crates ─────────────────────────────────────────────────────────
     "auth",
+    "compress",
     "config",
     "secrets",
     "observability",
+    "pricing",
+    "savings",
     "runtime",
     "react-agent",
     "orchestrator",
     "types",
     "utils",
     "server",
+    "coding-policy",
     "oci",
     "flow",
     "hitl",
@@ -20,7 +24,6 @@ members = [
     "mcp-gateway",
     "cli",
     "github",
-    "oidc",
     "bench",
     "bench-support",
 ]
@@ -32,12 +35,15 @@ version = "0.1.0"
 [workspace.dependencies]
 # ─── Internal OSS crates ────────────────────────────────────────────────────
 nasiko-auth = { path = "auth" }
+nasiko-compress = { path = "compress" }
 nasiko-config = { path = "config" }
+nasiko-pricing = { path = "pricing" }
+nasiko-savings = { path = "savings" }
 nasiko-flow = { path = "flow" }
+nasiko-hitl = { path = "hitl" }
 nasiko-agent-proxy = { path = "agent-proxy" }
 nasiko-mcp-gateway = { path = "mcp-gateway" }
 nasiko-github = { path = "github" }
-nasiko-oidc = { path = "oidc" }
 nasiko-secrets = { path = "secrets" }
 nasiko-observability = { path = "observability" }
 nasiko-runtime = { path = "runtime", default-features = false }
@@ -46,6 +52,7 @@ nasiko-orchestrator = { path = "orchestrator" }
 nasiko-types = { path = "types" }
 nasiko-utils = { path = "utils" }
 nasiko-server = { path = "server" }
+nasiko-coding-policy = { path = "coding-policy" }
 nasiko-oci = { path = "oci" }
 nasiko-llm-router = { path = "llm-router" }
 nasiko-bench-support = { path = "bench-support" }
@@ -57,7 +64,7 @@ serial_test = "3"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["json", "query", "multipart"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "decompression-zstd"] }
 
 # ─── OpenAPI docs ───────────────────────────────────────────────────────────
 utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
@@ -71,8 +78,8 @@ serde_json = "1"
 regex = "1"
 
 # ─── Database & state ───────────────────────────────────────────────────────
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "rust_decimal", "migrate", "json"] }
-redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "rust_decimal", "migrate", "json", "tls-rustls"] }
+redis = { version = "0.27", features = ["tokio-comp", "aio", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
 rust_decimal = { version = "1.36", features = ["serde", "db-postgres"] }
 
 # ─── Auth ───────────────────────────────────────────────────────────────────
@@ -81,8 +88,18 @@ bcrypt = "0.15"
 
 # ─── HTTP client ────────────────────────────────────────────────────────────
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rustls = { version = "0.23", features = ["ring"] }
+
+# ─── LLM orchestration ──────────────────────────────────────────────────────
+# Exact-pinned, not a "0.11" caret range: the orchestrator's HITL pause detection
+# (oss/react-agent) recovers a tool error through rig's type-erasure boxing, verified
+# against this exact version's `ToolSetError`/`ToolError::ToolCallError` shape
+# (rig-core-0.11.1/src/tool.rs). A `cargo update` under a caret range could silently
+# move that boxing behavior without anything here noticing.
+rig-core = { version = "=0.11.1", default-features = false, features = ["derive"] }
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
+toml_edit = "0.25"
 clap = { version = "4", features = ["derive"] }
 ureq = { version = "3", features = ["json"] }
 dialoguer = "0.11"
@@ -92,10 +109,13 @@ tar = "0.4"
 flate2 = "1"
 which = "7"
 include_dir = "0.7"
-toml_edit = "0.25"
 ratatui = "0.29"
 crossterm = "0.29"
 tabled = "0.21"
+# Already pulled in transitively via console (dialoguer's dep) at this exact version; declared
+# directly here only for `oss/cli`'s own scoped SIGINT no-op guard (hitl.rs) — see its doc
+# comment for why dialoguer/console's own Ctrl+C handling can't be used for this instead.
+libc = "0.2"
 
 # ─── Observability ──────────────────────────────────────────────────────────
 tracing = "0.1"
@@ -118,6 +138,7 @@ tempfile = "3"
 
 # ─── Archive ────────────────────────────────────────────────────────────────
 zip = { version = "2", default-features = false, features = ["deflate"] }
+zstd = "0.13"
 
 # ─── Versioning ─────────────────────────────────────────────────────────────
 semver = "1"
@@ -142,8 +163,9 @@ base64 = "0.22"
 dotenvy = "0.15"
 
 # ─── Embedding / registry ──────────────────────────────────────────────────
-rust-embed = { version = "8", features = ["mime-guess", "include-exclude"] }
+rust-embed = { version = "8", features = ["mime-guess", "include-exclude", "interpolate-folder-path"] }
 mime_guess = "2"
+percent-encoding = "2"
 
 mockito = "1"
 

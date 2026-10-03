@@ -6,6 +6,59 @@ use anyhow::Result;
 use include_dir::Dir;
 use serde_json;
 
+/// Best-effort scan of an agent's source directory for a reference to the MCP gateway env vars
+/// (`MCP_GATEWAY_URL`/`MCP_GATEWAY_TOKEN`) — the signal that this agent's own code is coded to
+/// call `/api/mcp`, as opposed to an agent that never touches it (every agent gets the credential
+/// injected regardless, per `oss/server/src/mcp/wiring.rs`, so its presence alone proves
+/// nothing). Shared by `deploy.rs`'s directory-deploy path (which builds straight from a
+/// directory) and `upload.rs`'s directory-source path (checked before it zips, rather than
+/// re-scanning the freshly built archive) — `upload.rs`'s zip-file-source path still needs its
+/// own zip-entry scan instead, since there's no directory to walk there. Skips common non-source
+/// directories and any file over 1MB; any read/walk failure is treated as "no reference found" —
+/// this is a hint, not a correctness check, so it must never fail the deploy/upload itself.
+pub fn dir_references_mcp_gateway(dir: &Path) -> bool {
+    const SKIP_DIRS: &[&str] = &[
+        ".git",
+        ".nasiko",
+        "node_modules",
+        "__pycache__",
+        "target",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+    ];
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let skip = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| SKIP_DIRS.contains(&n));
+            if !skip && dir_references_mcp_gateway(&path) {
+                return true;
+            }
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.len() > 1_000_000 {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if contents.contains("MCP_GATEWAY_URL") || contents.contains("MCP_GATEWAY_TOKEN") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Resolves the container CLI binary to shell out to. Honors `NASIKO_CONTAINER_CLI`
 /// if set, otherwise prefers `docker` and falls back to `podman` when `docker` isn't
 /// on PATH (e.g. podman-only dev setups without the podman-docker compat shim).

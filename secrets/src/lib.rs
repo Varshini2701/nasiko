@@ -67,6 +67,11 @@ const SYSTEM_SCOPE: &[u8] = b"nasiko-system";
 /// undecryptable.
 const PLATFORM_SETTINGS_SCOPE: &[u8] = b"platform-settings-v1";
 
+/// HKDF `info` label for the tenant-backup-restore canary check
+/// (the tenant stop/start lifecycle). Distinct from every other
+/// scope so it can never collide with a real secret.
+const BACKUP_CANARY_SCOPE: &[u8] = b"nasiko-backup-canary-v1";
+
 pub struct SecretsCrypto {
     cipher: Aes256Gcm,
 }
@@ -106,9 +111,9 @@ impl SecretsCrypto {
         Self::derive(connector_id.as_bytes())
     }
 
-    /// Derive a tenant-scoped key from the master key. Used by `ee/multi-tenant`
-    /// to encrypt a tenant cluster's FinOps-poller service-account credential at
-    /// rest. Panics if the master key is missing/invalid; use
+    /// Derive a tenant-scoped key from the master key. Used by the multi-tenant
+    /// control plane to encrypt a tenant cluster's FinOps-poller service-account
+    /// credential at rest. Panics if the master key is missing/invalid; use
     /// [`try_for_tenant`](Self::try_for_tenant) on the request path.
     pub fn for_tenant(tenant_id: Uuid) -> Self {
         Self::derive(tenant_id.as_bytes())
@@ -144,6 +149,26 @@ impl SecretsCrypto {
     /// master key is missing/invalid.
     pub fn for_platform_settings() -> Self {
         Self::derive(PLATFORM_SETTINGS_SCOPE)
+    }
+
+    /// Derive a cipher from an EXPLICIT master key (base64, 32 bytes) rather
+    /// than this process's own `SECRETS_ENCRYPTION_KEY` env var.
+    ///
+    /// Every other constructor derives from the calling process's own master
+    /// key; this one exists for the tenant stop/start lifecycle, which works
+    /// with a DIFFERENT cluster's key material — captured from its
+    /// `nasiko-secrets` Secret before teardown and never installed into this
+    /// process's environment. Used to encrypt/decrypt a small canary value at
+    /// backup/restore time, proving the restored key actually decrypts
+    /// before the caller trusts it with real secrets.
+    pub fn for_backup_canary(master_key_b64: &str) -> Result<Self, SecretsError> {
+        let bytes = BASE64
+            .decode(master_key_b64)
+            .map_err(|_| SecretsError::InvalidKeyLength)?;
+        if bytes.len() != 32 {
+            return Err(SecretsError::InvalidKeyLength);
+        }
+        Ok(Self::derive_with_master(BACKUP_CANARY_SCOPE, &bytes))
     }
 
     // ── Encrypt / decrypt ───────────────────────────────────────────────────
@@ -214,6 +239,13 @@ impl SecretsCrypto {
     fn for_user_with_master(user_id: Uuid, master: &[u8]) -> Self {
         Self::derive_with_master(user_id.as_bytes(), master)
     }
+
+    /// Same as [`for_user_with_master`](Self::for_user_with_master), for the
+    /// tenant scope.
+    #[cfg(test)]
+    fn for_tenant_with_master(tenant_id: Uuid, master: &[u8]) -> Self {
+        Self::derive_with_master(tenant_id.as_bytes(), master)
+    }
 }
 
 fn try_load_master_key() -> Result<Vec<u8>, SecretsError> {
@@ -271,6 +303,56 @@ mod tests {
         // Same master, different scope ⇒ independent key ⇒ GCM auth fails.
         assert!(
             SecretsCrypto::for_user_with_master(b, &MASTER)
+                .decrypt(&ct)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn for_tenant_round_trips() {
+        let tenant_id = Uuid::parse_str(VECTOR_UUID).unwrap();
+        let crypto = SecretsCrypto::for_tenant_with_master(tenant_id, &MASTER);
+        let ct = crypto.encrypt("tenant-secret");
+        assert_eq!(crypto.decrypt(&ct).unwrap(), "tenant-secret");
+    }
+
+    #[test]
+    fn for_backup_canary_round_trips() {
+        let master_b64 = BASE64.encode(MASTER);
+        let crypto = SecretsCrypto::for_backup_canary(&master_b64).unwrap();
+        let ct = crypto.encrypt("nasiko-tenant-backup-canary-v1");
+        assert_eq!(
+            crypto.decrypt(&ct).unwrap(),
+            "nasiko-tenant-backup-canary-v1"
+        );
+    }
+
+    #[test]
+    fn for_backup_canary_different_master_keys_cannot_decrypt_each_other() {
+        let a = BASE64.encode([1u8; 32]);
+        let b = BASE64.encode([2u8; 32]);
+        let ct = SecretsCrypto::for_backup_canary(&a).unwrap().encrypt("x");
+        assert!(
+            SecretsCrypto::for_backup_canary(&b)
+                .unwrap()
+                .decrypt(&ct)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn for_backup_canary_rejects_a_malformed_key() {
+        assert!(SecretsCrypto::for_backup_canary("not-base64!!!").is_err());
+        assert!(SecretsCrypto::for_backup_canary(&BASE64.encode([1u8; 16])).is_err());
+    }
+
+    #[test]
+    fn for_tenant_different_uuids_cannot_decrypt_each_other() {
+        let a = Uuid::parse_str(VECTOR_UUID).unwrap();
+        let b = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let ct = SecretsCrypto::for_tenant_with_master(a, &MASTER).encrypt("x");
+        assert!(
+            SecretsCrypto::for_tenant_with_master(b, &MASTER)
                 .decrypt(&ct)
                 .is_err()
         );

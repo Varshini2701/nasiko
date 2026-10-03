@@ -144,6 +144,7 @@ pub fn snapshot(raw: &str) -> Result<SessionSnapshot> {
     })?;
     Ok(SessionSnapshot {
         session_id: payload.session_id,
+        title: None,
         turns: turns_from_messages(&payload.messages),
     })
 }
@@ -253,6 +254,7 @@ fn turns_from_messages(messages: &[Message]) -> Vec<Turn> {
                         .saturating_add(token(info.tokens.reasoning)),
                     cache_read_tokens: token(info.tokens.cache.read),
                     cache_creation_tokens: token(info.tokens.cache.write),
+                    accounting: None,
                     started_at,
                     ended_at,
                 });

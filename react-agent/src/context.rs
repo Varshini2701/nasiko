@@ -1,3 +1,4 @@
+use nasiko_compress::Policy;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for context window management.
@@ -9,6 +10,15 @@ pub struct ContextConfig {
     pub keep_recent: usize,
     /// Rough chars-per-token estimate for budget tracking.
     pub chars_per_token: usize,
+    /// Structural compression applied to tool results as they are stored.
+    ///
+    /// This is the store, not the wire: it shrinks what the loop keeps, which also defers
+    /// `max_context_tokens` compaction. The llm-router seam compresses what an agent *sends*;
+    /// the two compose because compression is idempotent, so a payload that passes through
+    /// both is compressed once.
+    ///
+    /// Disabled by default — an unconfigured loop stores exactly what it stored before.
+    pub compress: Policy<'static>,
 }
 
 impl Default for ContextConfig {
@@ -17,6 +27,7 @@ impl Default for ContextConfig {
             max_context_tokens: 80_000,
             keep_recent: 12,
             chars_per_token: 4,
+            compress: Policy::default(),
         }
     }
 }
@@ -70,11 +81,14 @@ impl ContextManager {
     }
 
     pub fn push_tool_result(&mut self, tool_name: &str, content: &str) {
+        // Compress on the way in, so `push`'s token estimate — and therefore the compaction
+        // trigger — sees the size the loop will actually carry.
+        let stored = nasiko_compress::compress(content, &self.config.compress);
         self.push(ContextEntry {
             role: ContextRole::ToolResult {
                 tool_name: tool_name.to_string(),
             },
-            content: content.to_string(),
+            content: stored.into_text(),
         });
     }
 
@@ -252,7 +266,112 @@ mod tests {
             max_context_tokens: 1_000_000,
             keep_recent: 1,
             chars_per_token: 4,
+            compress: Policy::default(),
         }
+    }
+
+    // ── IP-3: tool-result compression ───────────────────────────────────────
+
+    /// 300 lines of timestamped log — the shape a tool result actually takes.
+    fn noisy_tool_result() -> String {
+        (0..300)
+            .map(|i| format!("2026-01-01T00:00:00Z INFO handled request {i}\n"))
+            .collect()
+    }
+
+    fn compressing_config() -> ContextConfig {
+        ContextConfig {
+            compress: Policy {
+                enabled: true,
+                min_bytes: 0,
+                ..Policy::default()
+            },
+            ..ContextConfig::default()
+        }
+    }
+
+    #[test]
+    fn tool_results_are_stored_verbatim_by_default() {
+        // The zero-behaviour-change guard: an unconfigured loop must store what it always did.
+        let payload = noisy_tool_result();
+        let mut ctx = ContextManager::new(ContextConfig::default());
+
+        ctx.push_tool_result("fetch_logs", &payload);
+
+        assert_eq!(ctx.entries.last().unwrap().content, payload);
+    }
+
+    #[test]
+    fn enabling_compression_shrinks_what_is_stored() {
+        let payload = noisy_tool_result();
+        let mut ctx = ContextManager::new(compressing_config());
+
+        ctx.push_tool_result("fetch_logs", &payload);
+
+        let stored = &ctx.entries.last().unwrap().content;
+        assert!(
+            stored.len() < payload.len(),
+            "stored {} bytes, original {}",
+            stored.len(),
+            payload.len()
+        );
+    }
+
+    #[test]
+    fn compression_defers_the_compaction_cliff() {
+        // The quality claim in PRD §9 IP-3: a smaller store reaches `max_context_tokens` later.
+        let payload = noisy_tool_result();
+
+        let mut plain = ContextManager::new(ContextConfig::default());
+        let mut compressed = ContextManager::new(compressing_config());
+        for _ in 0..20 {
+            plain.push_tool_result("fetch_logs", &payload);
+            compressed.push_tool_result("fetch_logs", &payload);
+        }
+
+        assert!(
+            compressed.estimated_tokens < plain.estimated_tokens,
+            "compressed {} vs plain {} estimated tokens",
+            compressed.estimated_tokens,
+            plain.estimated_tokens
+        );
+    }
+
+    #[test]
+    fn a_second_pass_at_the_router_seam_would_be_a_no_op() {
+        // IP-3 and IP-1 both run on the same bytes when an agent forwards a stored result.
+        // Idempotence (invariant I3) is what keeps that from compounding into a second elision.
+        let payload = noisy_tool_result();
+        let mut ctx = ContextManager::new(compressing_config());
+        ctx.push_tool_result("fetch_logs", &payload);
+        let stored = ctx.entries.last().unwrap().content.clone();
+
+        let policy = Policy {
+            enabled: true,
+            min_bytes: 0,
+            ..Policy::default()
+        };
+        let again = nasiko_compress::compress(&stored, &policy);
+
+        assert_eq!(again.into_text(), stored);
+    }
+
+    #[test]
+    fn dry_run_measures_without_changing_the_store() {
+        let payload = noisy_tool_result();
+        let mut ctx = ContextManager::new(ContextConfig {
+            compress: Policy {
+                enabled: true,
+                min_bytes: 0,
+                dry_run: true,
+                ..Policy::default()
+            },
+            ..ContextConfig::default()
+        });
+
+        ctx.push_tool_result("fetch_logs", &payload);
+
+        assert_eq!(ctx.entries.last().unwrap().content, payload);
     }
 
     #[test]

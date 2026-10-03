@@ -182,6 +182,7 @@ mod tests {
             writable: false,
             writable_path: None,
             owner_id: uuid::Uuid::nil(),
+            force_pull: false,
         }
     }
 

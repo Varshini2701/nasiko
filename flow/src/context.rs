@@ -51,7 +51,7 @@ impl FlowContext {
         format!("flow:{}", self.flow_id)
     }
 
-    fn generate_span_id() -> String {
+    pub fn generate_span_id() -> String {
         let id = Uuid::new_v4();
         let bytes = id.as_bytes();
         bytes[..8].iter().map(|b| format!("{:02x}", b)).collect()

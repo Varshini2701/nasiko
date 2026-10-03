@@ -1,20 +1,63 @@
 use std::sync::Arc;
 
+use crate::completion::{CompletionEvent, UsageModel};
 use futures::StreamExt;
-use rig::completion::message::{ToolCall, ToolFunction};
+use rig::completion::message::ToolCall;
 use rig::completion::{AssistantContent, CompletionModel as _, Message, ToolDefinition};
-use rig::providers::openai;
-use rig::streaming::StreamingChoice;
-use rig::tool::{ToolDyn, ToolSet};
+use rig::tool::{ToolDyn, ToolError, ToolSet, ToolSetError};
 use tokio::sync::mpsc;
 
-use crate::a2a::A2aClient;
+use crate::a2a::{A2aClient, PauseInfo};
 use crate::context::{ContextConfig, ContextManager};
 use crate::error::OrchestratorError;
-use crate::events::OrchestratorEvent;
+use crate::events::{OrchestratorEvent, PolicyRejectionKind};
 use crate::guard::CallGuard;
+use crate::policy::DelegationPolicy;
 use crate::registry::{AgentInfo, AgentRegistry, RegistrySource};
-use crate::tool::{A2aTool, DelegationContext};
+use crate::tool::{A2aTool, A2aToolError};
+
+/// The outcome of one `toolset.call()`, with a real pause recovered from `rig`'s type-erased
+/// `Result<String, ToolSetError>` instead of being indistinguishable from an ordinary failure.
+/// Pure — no side effects, no channel sends — so every `toolset.call()` site (`Orchestrator::run()`
+/// and both of `run_stream_inner()`'s) can classify identically by calling the same function,
+/// rather than each independently deciding what counts as a pause.
+///
+/// Deliberately not `Success(String)`/`Failure(String)` variants carrying the `Ok`/`Err` payload:
+/// every call site already has its own existing, unchanged handling for the non-pause case
+/// (`match result { Ok(..) => .., Err(..) => .. }`, untouched by this classification) — a
+/// `NotAwaitingHuman` outcome that duplicated that payload would just be dead weight nothing
+/// reads, which is exactly what the compiler's `dead_code` lint caught on the first version of
+/// this enum.
+enum ToolOutcome {
+    AwaitingHuman {
+        agent: String,
+        agent_id: String,
+        pause: PauseInfo,
+    },
+    NotAwaitingHuman,
+}
+
+/// Recovers `A2aToolError::AwaitingHuman` through `rig-core`'s type erasure: `ToolSetError`
+/// wraps `ToolError::ToolCallError(Box<dyn std::error::Error + Send + Sync>)`, built by `rig`'s
+/// own blanket `ToolDyn` impl from the tool's real `A2aToolError`. `downcast_ref` recovers the
+/// concrete type from that box — proven against the actual pinned `rig-core` dependency in
+/// `tool.rs`'s `awaiting_human_survives_rig_toolset_erasure` test, not assumed here.
+fn classify_tool_result(result: &Result<String, ToolSetError>) -> ToolOutcome {
+    if let Err(ToolSetError::ToolCallError(ToolError::ToolCallError(boxed))) = result
+        && let Some(A2aToolError::AwaitingHuman {
+            agent,
+            agent_id,
+            pause,
+        }) = boxed.downcast_ref::<A2aToolError>()
+    {
+        return ToolOutcome::AwaitingHuman {
+            agent: agent.clone(),
+            agent_id: agent_id.clone(),
+            pause: pause.clone(),
+        };
+    }
+    ToolOutcome::NotAwaitingHuman
+}
 
 /// Attribute one completion's total token cost evenly across the tool calls
 /// it produced — the API gives one usage figure per completion, not per tool
@@ -24,6 +67,214 @@ fn tokens_per_tool_call(completion_tokens: Option<u64>, num_tool_calls: usize) -
     completion_tokens
         .map(|t| t / num_tool_calls.max(1) as u64)
         .unwrap_or(0)
+}
+
+/// Does the operator's policy refuse this call? `Some(reason)` if so.
+///
+/// The decision only — no reporting — because the two loops report it in
+/// different shapes (`run_stream_inner` sends an event, `run` records a trace)
+/// and only the *decision* has to stay identical between them.
+fn policy_refusal(config: &OrchestratorConfig, tc: &ToolCall) -> Option<String> {
+    config
+        .policy
+        .as_ref()
+        .and_then(|p| p.check_tool_call(&tc.function.arguments).err())
+}
+
+/// What the model is told when a call is blocked, in the tool-result context.
+///
+/// One wording for both loops. They had drifted — one said `Blocked:` and the
+/// other `BLOCKED: … Do NOT retry`, so the same policy taught the model two
+/// different lessons depending on which entry point ran it.
+fn blocked_note(tool_name: &str, reason: &str) -> String {
+    format!(
+        "[{tool_name}] BLOCKED: {reason}. Do NOT retry this agent with different \
+         arguments unless you have a concrete reason to."
+    )
+}
+
+/// The policy + call-guard gate for one tool call, in `run_stream_inner`'s
+/// event-channel reporting style (`OrchestratorEvent::PolicyRejected` plus a
+/// message telling the model not to retry). Both of its branches call this —
+/// they differ in how a turn gets here, not in what a rejection looks like once
+/// it has, and this used to be a byte-for-byte copy in each, with no structural
+/// signal that a change to one needed the other.
+///
+/// `true` means the call was blocked — already reported on `tx` and already
+/// pushed onto `results_for_context` — so the caller should `continue` its loop
+/// rather than call the tool.
+async fn call_is_blocked(
+    tc: &ToolCall,
+    agent_display: &str,
+    config: &OrchestratorConfig,
+    guard: Option<&dyn CallGuard>,
+    tx: &mpsc::Sender<OrchestratorEvent>,
+    turn_idx: usize,
+    results_for_context: &mut Vec<String>,
+) -> bool {
+    let name = &tc.function.name;
+
+    // Operator policy first, before the flow guard: a call the policy rejects
+    // should never consume fan-out or depth budget, and `before_call`
+    // increments both.
+    if let Some(reason) = policy_refusal(config, tc) {
+        let _ = tx
+            .send(OrchestratorEvent::PolicyRejected {
+                agent: agent_display.to_string(),
+                reason: reason.clone(),
+                turn: turn_idx + 1,
+                kind: PolicyRejectionKind::Delegation,
+            })
+            .await;
+        results_for_context.push(blocked_note(name, &reason));
+        return true;
+    }
+
+    if let Some(g) = guard
+        && let Err(reason) = g.before_call(agent_display).await
+    {
+        let _ = tx
+            .send(OrchestratorEvent::PolicyRejected {
+                agent: agent_display.to_string(),
+                reason: reason.clone(),
+                turn: turn_idx + 1,
+                kind: PolicyRejectionKind::FlowGuard,
+            })
+            .await;
+        results_for_context.push(blocked_note(name, &reason));
+        return true;
+    }
+
+    false
+}
+
+/// The orchestrator's system prompt. One builder for both loops — `run()` and
+/// `run_stream_inner()` previously carried byte-identical copies of this text,
+/// so a change to the policy had to be made twice to take effect.
+///
+/// The roster/protocol/rules block is the stable prefix and the two
+/// caller-supplied sections come last, so OpenAI's prefix-based prompt caching
+/// hits across turns even when those sections change. `{custom}` (e.g. the L1A
+/// supplemental context built in `oss/server/src/router/a2a_dispatch.rs`) is a
+/// query-ranked top-k slice, so it varies turn to turn; it used to sit at the
+/// very top, where any variation invalidated the whole cached prompt.
+///
+/// `{policy_footer}` is placed after `{custom}` even though it is the more
+/// stable of the two, because it is the one section whose purpose depends on
+/// being read last: a rule about HOW to answer was reliably ignored when it sat
+/// earlier (see `DelegationPolicy::preamble_footer`). The cost is that the
+/// org-rules block — at most fifty short lines — falls outside the cached
+/// prefix, while the far larger stable block ahead of it still caches. Ordering
+/// them the other way would re-bury the rules behind a `{custom}` that grows
+/// with the size of the fleet.
+fn build_preamble(config: &OrchestratorConfig, agents: &[AgentInfo]) -> String {
+    let agent_list: String = agents
+        .iter()
+        .map(|a| {
+            let skills = a
+                .skills
+                .iter()
+                .map(|s| {
+                    // The skill's own documented inputs. Without them the model invents wording
+                    // for a skill that may only answer to an exact phrase — and the agent then
+                    // answers a question the user never asked.
+                    let examples = if s.examples.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "\n      send exactly: {}",
+                            s.examples
+                                .iter()
+                                .map(|e| format!("\"{e}\""))
+                                .collect::<Vec<_>>()
+                                .join(" | ")
+                        )
+                    };
+                    format!("    - {}: {}{}", s.name, s.description, examples)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "  • {} (tool: `{}`)\n    {}\n{}",
+                a.name,
+                A2aTool::tool_name(&a.name),
+                a.description,
+                skills
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    // Each section carries its OWN separator rather than taking one from the
+    // template, so an absent section leaves nothing behind — not even the blank
+    // line a `{placeholder}` wrapped in newlines would. With no policy and no
+    // caller preamble the prompt below carries no trace that either seam exists,
+    // which `no_policy_leaves_the_preamble_untouched` pins against the exact
+    // joins rather than against trimmed text. (It no longer matches the prompt
+    // from before the seam byte for byte — `{custom}` has since moved from the
+    // top to the tail for prompt-cache stability, see this function's docs.)
+    // `custom` carries its own separator for the same reason the policy sections
+    // below do: an absent section must leave nothing behind, not even the blank
+    // line a `{placeholder}` wrapped in newlines would.
+    let custom = match config.preamble.as_deref() {
+        Some(text) if !text.trim().is_empty() => format!("\n\n{text}"),
+        _ => String::new(),
+    };
+
+    let policy = config.policy.as_ref();
+    let delegation_policy = match policy.map(|p| p.preamble_policy()) {
+        Some(text) if !text.trim().is_empty() => format!("{text}\n\n"),
+        _ => String::new(),
+    };
+    let policy_footer = match policy.map(|p| p.preamble_footer()) {
+        Some(text) if !text.trim().is_empty() => format!("\n\n{text}"),
+        _ => String::new(),
+    };
+
+    format!(
+        r#"You are a ReAct orchestrator. Fulfill user requests by reasoning and delegating to specialized agents.
+
+## Available Agents
+
+{agent_list}
+
+{delegation_policy}## Protocol
+
+1. Analyze the user's request. Determine which agent(s) can help.
+2. Call the appropriate agent tool with a clear, specific message.
+3. If the task requires multiple agents, call them sequentially — use earlier results to inform later calls.
+4. Once you have enough information, respond with a complete answer as plain text (no tool call).
+5. If an agent fails, reason about alternatives or inform the user.
+
+## Rules
+
+- Only relay facts from agent responses. Never fabricate.
+- Prefer the most specific agent for each sub-task.
+- Pass the user's own wording through when the request is itself the thing to relay — an exact
+  phrase, a quoted string, a command, an identifier, a fixed test input. Paraphrasing it loses
+  information the agent matches on, and the agent then answers a question the user never asked.
+- If no agent fits, tell the user directly.
+- When calling an agent tool, call it directly — do not first restate its message as your own chat reply. If that agent pauses to ask the user something, your own words would otherwise repeat the same question twice.{custom}{policy_footer}"#
+    )
+}
+
+/// The last gate before a final answer reaches the user: the configured policy,
+/// if any, gets to replace it.
+///
+/// Returns the text to actually send, so callers cannot forget to use the
+/// result. With no policy the model's own answer is what ships, which is the
+/// open-source behaviour.
+fn finalize_answer(
+    text: &str,
+    config: &OrchestratorConfig,
+    agents: &[AgentInfo],
+    delegated: bool,
+    turn_idx: usize,
+) -> String {
+    match &config.policy {
+        Some(policy) => policy.review_final_answer(text, agents, delegated, turn_idx),
+        None => text.to_string(),
+    }
 }
 
 /// Configuration for the orchestrator.
@@ -38,6 +289,14 @@ pub struct OrchestratorConfig {
     pub base_url: Option<String>,
     /// API key. If None, uses OPENAI_API_KEY env var.
     pub api_key: Option<String>,
+    /// Operator policy governing what this orchestration is allowed to do —
+    /// see [`DelegationPolicy`]. `None` imposes nothing, which is what an
+    /// unconfigured deployment runs with.
+    ///
+    /// Separate from `preamble` on purpose: `preamble` is the caller's own
+    /// framing of what this orchestrator is for, while a policy is operator
+    /// rules that outlive any one caller.
+    pub policy: Option<Arc<dyn DelegationPolicy>>,
 }
 
 impl Default for OrchestratorConfig {
@@ -50,6 +309,7 @@ impl Default for OrchestratorConfig {
             temperature: Some(0.2),
             base_url: None,
             api_key: None,
+            policy: None,
         }
     }
 }
@@ -84,7 +344,7 @@ pub struct Orchestrator {
     a2a_client: Arc<A2aClient>,
     context: ContextManager,
     guard: Option<Arc<dyn CallGuard>>,
-    delegation: Option<DelegationContext>,
+    model: Result<UsageModel, String>,
 }
 
 impl Orchestrator {
@@ -92,13 +352,14 @@ impl Orchestrator {
         let a2a_client = Arc::new(A2aClient::new());
         let registry = AgentRegistry::new(registry_source);
         let context = ContextManager::new(config.context.clone());
+        let model = UsageModel::from_config(&config);
         Self {
+            model,
             config,
             registry,
             a2a_client,
             context,
             guard: None,
-            delegation: None,
         }
     }
 
@@ -109,13 +370,6 @@ impl Orchestrator {
 
     pub fn with_guard(mut self, guard: Arc<dyn CallGuard>) -> Self {
         self.guard = Some(guard);
-        self
-    }
-
-    /// Attach the calling user's identity so every agent this orchestrator
-    /// invokes receives a per-agent MCP delegation token (see `A2aTool`).
-    pub fn with_delegation(mut self, delegation: DelegationContext) -> Self {
-        self.delegation = Some(delegation);
         self
     }
 
@@ -156,10 +410,11 @@ impl Orchestrator {
 
         let model = self.build_model()?;
         let (toolset, tool_defs) = self.build_tools(&agents).await;
-        let preamble = self.build_preamble(&agents);
+        let preamble = build_preamble(&self.config, &agents);
 
         let mut turns = Vec::new();
         let mut context_compacted = false;
+        let mut delegated = false;
 
         // Preamble is STABLE across turns — provider can cache this prefix.
         // All dynamic context goes into user messages instead.
@@ -183,6 +438,20 @@ impl Orchestrator {
                 .preamble(preamble.clone())
                 .tools(tool_defs.clone());
 
+            // Nothing the policy will accept from an undelegated turn is long,
+            // and anything long is about to be discarded — so stop paying to
+            // generate it. Sized against the query, because this is also the
+            // turn that relays it into a tool call.
+            if !delegated
+                && let Some(cap) = self
+                    .config
+                    .policy
+                    .as_ref()
+                    .and_then(|p| p.undelegated_max_tokens(user_query.chars().count()))
+            {
+                req = req.max_tokens(cap);
+            }
+
             if let Some(temp) = self.config.temperature {
                 req = req.temperature(temp);
             }
@@ -198,11 +467,7 @@ impl Orchestrator {
             // call). Without this, `after_call` always received a literal 0
             // and `FlowGuard::record_tokens`/`TokenBudgetExhausted` could
             // never fire.
-            let completion_tokens = response
-                .raw_response
-                .usage
-                .as_ref()
-                .map(|u| u.total_tokens as u64);
+            let completion_tokens = response.raw_response.usage.as_ref().map(|u| u.total_tokens);
 
             // Partition the response into text and tool calls
             let mut text_parts = Vec::new();
@@ -239,6 +504,21 @@ impl Orchestrator {
                         .unwrap_or(name)
                         .replace('_', "-");
 
+                    // Operator policy first — see the streaming path's own note.
+                    // Shares `policy_refusal`/`blocked_note` with that path, so
+                    // the two entry points cannot reach different verdicts or
+                    // teach the model different lessons about the same block.
+                    if let Some(reason) = policy_refusal(&self.config, tc) {
+                        tracing::warn!(tool = %name, %reason, "delegation policy blocked");
+                        trace.tool_calls.push(ToolCallTrace {
+                            tool_name: name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                            result: Err(reason.clone()),
+                        });
+                        results_for_context.push(blocked_note(name, &reason));
+                        continue;
+                    }
+
                     // Enforce call guard
                     if let Some(g) = &self.guard
                         && let Err(reason) = g.before_call(&agent_display).await
@@ -257,6 +537,42 @@ impl Orchestrator {
 
                     let result = toolset.call(name, args_str).await;
 
+                    // A pause is not a tool outcome to trace or reason over — stop the whole run
+                    // immediately, before it's recorded as just another failed/successful call.
+                    if let ToolOutcome::AwaitingHuman {
+                        agent,
+                        agent_id,
+                        pause,
+                    } = classify_tool_result(&result)
+                    {
+                        if let Some(g) = &self.guard {
+                            g.after_call(&agent_display, tokens_per_call).await;
+                        }
+                        // Preserve any earlier calls in this same batch that already completed
+                        // before this one paused — without this, they're silently discarded here,
+                        // since the push_tool_result call below (which normally records the whole
+                        // batch) is never reached once we return. `results_for_context.len()` is
+                        // exactly the count of `tool_calls` processed so far: every earlier
+                        // iteration either pushed a result/error/block entry or hit this same
+                        // pause check itself, so the slice lines up with what's actually recorded.
+                        if !results_for_context.is_empty() {
+                            let completed_names = tool_calls[..results_for_context.len()]
+                                .iter()
+                                .map(|tc| tc.function.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("+");
+                            self.context.push_tool_result(
+                                &completed_names,
+                                &results_for_context.join("\n\n"),
+                            );
+                        }
+                        return Err(OrchestratorError::AwaitingHuman {
+                            agent,
+                            agent_id,
+                            pause: Box::new(pause),
+                        });
+                    }
+
                     let call_trace = ToolCallTrace {
                         tool_name: name.clone(),
                         arguments: tc.function.arguments.clone(),
@@ -273,6 +589,7 @@ impl Orchestrator {
                                 g.after_call(&agent_display, tokens_per_call).await;
                             }
                             results_for_context.push(format!("[{}] Result: {}", name, output));
+                            delegated = true;
                         }
                         Err(e) => {
                             // Balance the before_call() depth increment even on
@@ -302,7 +619,13 @@ impl Orchestrator {
                 turns.push(trace);
             } else {
                 // No tool calls — this is the final text response
-                let final_text = text_parts.join("\n");
+                let final_text = finalize_answer(
+                    &text_parts.join("\n"),
+                    &self.config,
+                    &agents,
+                    delegated,
+                    turn_idx,
+                );
                 self.context.push_assistant(&final_text);
 
                 turns.push(TurnTrace {
@@ -336,6 +659,18 @@ impl Orchestrator {
     /// Returns a receiver; the orchestration runs in the background.
     /// `file_parts` are pre-serialized A2A Part JSON values from the user's
     /// upload — forwarded to whichever agent the orchestrator selects.
+    ///
+    /// The in-memory context this streams against is write-only from the caller's perspective:
+    /// `context` below is a clone handed to the spawned task, and every `push_tool_result`/
+    /// `push_assistant` inside `run_stream_inner` mutates that clone, which is simply dropped when
+    /// the task ends — `self.context` on this `Orchestrator` is never updated by a streaming turn,
+    /// including the record that a sub-agent paused awaiting a human (found in review). This is
+    /// currently safe only because the one caller that resumes after a streaming pause
+    /// (`trigger_new_orchestrator_turn`, `oss/server/src/hitl/mod.rs`) rebuilds its own context
+    /// from `SessionHistory::fetch` rather than trusting this `Orchestrator`'s in-memory state — do
+    /// not add a caller that relies on `self.context` reflecting a prior `run_stream` call's
+    /// effects without first making this shared (e.g. `Arc<Mutex<ContextManager>>`) rather than
+    /// cloned.
     pub fn run_stream(
         &mut self,
         user_query: &str,
@@ -356,24 +691,28 @@ impl Orchestrator {
         let registry = self.registry.clone();
         let agents_ctx = AgentCallContext {
             a2a_client: self.a2a_client.clone(),
-            delegation: self.delegation.clone(),
+            model: self.model.clone(),
         };
         let mut context = self.context.clone();
         let guard = self.guard.clone();
 
-        tokio::spawn(async move {
-            let _ = run_stream_inner(
-                &config,
-                &registry,
-                &agents_ctx,
-                &mut context,
-                &query,
-                &tx,
-                guard.as_deref(),
-                &file_parts_json,
-            )
-            .await;
-        });
+        use tracing::Instrument;
+        tokio::spawn(
+            async move {
+                let _ = run_stream_inner(
+                    &config,
+                    &registry,
+                    &agents_ctx,
+                    &mut context,
+                    &query,
+                    &tx,
+                    guard.as_deref(),
+                    &file_parts_json,
+                )
+                .await;
+            }
+            .in_current_span(),
+        );
 
         rx
     }
@@ -383,27 +722,8 @@ impl Orchestrator {
         self.context = ContextManager::new(self.config.context.clone());
     }
 
-    fn build_model(&self) -> Result<openai::CompletionModel, OrchestratorError> {
-        let api_key = self
-            .config
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-            .ok_or_else(|| OrchestratorError::LlmConfig("OPENAI_API_KEY not set".into()))?;
-
-        let base_url = self
-            .config
-            .base_url
-            .clone()
-            .or_else(|| std::env::var("OPENAI_BASE_URL").ok());
-
-        let client = if let Some(url) = base_url {
-            openai::Client::from_url(&api_key, &url)
-        } else {
-            openai::Client::new(&api_key)
-        };
-
-        Ok(client.completion_model(&self.config.model))
+    fn build_model(&self) -> Result<UsageModel, OrchestratorError> {
+        self.model.clone().map_err(OrchestratorError::LlmConfig)
     }
 
     async fn build_tools(&self, agents: &[AgentInfo]) -> (ToolSet, Vec<ToolDefinition>) {
@@ -412,70 +732,20 @@ impl Orchestrator {
 
         for agent in agents {
             let tool = A2aTool::new(agent.clone(), self.a2a_client.clone())
-                .with_delegation(self.delegation.clone());
+                .with_policy(self.config.policy.clone());
             defs.push(ToolDyn::definition(&tool, String::new()).await);
             builder = builder.static_tool(tool);
         }
 
         (builder.build(), defs)
     }
-
-    fn build_preamble(&self, agents: &[AgentInfo]) -> String {
-        let custom = self.config.preamble.as_deref().unwrap_or("");
-
-        let agent_list: String = agents
-            .iter()
-            .map(|a| {
-                let skills = a
-                    .skills
-                    .iter()
-                    .map(|s| format!("    - {}: {}", s.name, s.description))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!(
-                    "  • {} (tool: `{}`)\n    {}\n{}",
-                    a.name,
-                    A2aTool::tool_name(&a.name),
-                    a.description,
-                    skills
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        format!(
-            r#"You are a ReAct orchestrator. Fulfill user requests by reasoning and delegating to specialized agents.
-
-{custom}
-
-## Available Agents
-
-{agent_list}
-
-## Protocol
-
-1. Analyze the user's request. Determine which agent(s) can help.
-2. Call the appropriate agent tool with a clear, specific message.
-3. If the task requires multiple agents, call them sequentially — use earlier results to inform later calls.
-4. Once you have enough information, respond with a complete answer as plain text (no tool call).
-5. If an agent fails, reason about alternatives or inform the user.
-
-## Rules
-
-- Only relay facts from agent responses. Never fabricate.
-- Prefer the most specific agent for each sub-task.
-- If no agent fits, tell the user directly."#
-        )
-    }
 }
 
-/// Bundles the two things needed to actually reach an agent — the shared HTTP
-/// client and (optionally) the calling user's identity for per-agent MCP
-/// delegation tokens — so `run_stream_inner` doesn't need them as separate
-/// arguments.
+/// What's needed to actually reach an agent — the shared HTTP client. (Agents
+/// carry their own MCP gateway credential; no per-call user token exists.)
 struct AgentCallContext {
     a2a_client: Arc<A2aClient>,
-    delegation: Option<DelegationContext>,
+    model: Result<UsageModel, String>,
 }
 
 /// Inner streaming implementation. Sends events to the channel as orchestration progresses.
@@ -506,14 +776,9 @@ async fn run_stream_inner(
         return Err(OrchestratorError::NoAgents);
     }
 
-    let api_key = match config
-        .api_key
-        .clone()
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-    {
-        Some(k) => k,
-        None => {
-            let message = "OPENAI_API_KEY not set".to_string();
+    let model = match agents_ctx.model.clone() {
+        Ok(model) => model,
+        Err(message) => {
             let _ = tx
                 .send(OrchestratorEvent::Error {
                     message: message.clone(),
@@ -523,103 +788,70 @@ async fn run_stream_inner(
         }
     };
 
-    let base_url = config
-        .base_url
-        .clone()
-        .or_else(|| std::env::var("OPENAI_BASE_URL").ok());
-
-    let client = if let Some(url) = base_url {
-        openai::Client::from_url(&api_key, &url)
-    } else {
-        openai::Client::new(&api_key)
-    };
-    let model = client.completion_model(&config.model);
-
     // Build tools from agents. This is the streaming loop, so each agent call
     // relays the sub-agent's live progress into the event stream.
     let mut builder = ToolSet::builder();
     let mut tool_defs = Vec::new();
     for agent in &agents {
-        // Streaming loop: keep BOTH features — delegation (per-agent MCP token,
-        // this branch) and live progress relay (main).
+        // Streaming loop: each agent call relays live progress into the stream.
         let tool = A2aTool::new(agent.clone(), agents_ctx.a2a_client.clone())
-            .with_delegation(agents_ctx.delegation.clone())
             .with_progress(tx.clone())
-            .with_file_parts(file_parts.to_vec());
+            .with_file_parts(file_parts.to_vec())
+            .with_policy(config.policy.clone());
         tool_defs.push(ToolDyn::definition(&tool, String::new()).await);
         builder = builder.static_tool(tool);
     }
     let toolset = builder.build();
 
-    // Build preamble
-    let custom = config.preamble.as_deref().unwrap_or("");
-    let agent_list: String = agents
-        .iter()
-        .map(|a| {
-            let skills = a
-                .skills
-                .iter()
-                .map(|s| format!("    - {}: {}", s.name, s.description))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "  • {} (tool: `{}`)\n    {}\n{}",
-                a.name,
-                A2aTool::tool_name(&a.name),
-                a.description,
-                skills
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    let preamble = format!(
-        r#"You are a ReAct orchestrator. Fulfill user requests by reasoning and delegating to specialized agents.
-
-{custom}
-
-## Available Agents
-
-{agent_list}
-
-## Protocol
-
-1. Analyze the user's request. Determine which agent(s) can help.
-2. Call the appropriate agent tool with a clear, specific message.
-3. If the task requires multiple agents, call them sequentially — use earlier results to inform later calls.
-4. Once you have enough information, respond with a complete answer as plain text (no tool call).
-5. If an agent fails, reason about alternatives or inform the user.
-
-## Rules
-
-- Only relay facts from agent responses. Never fabricate.
-- Prefer the most specific agent for each sub-task.
-- If no agent fits, tell the user directly."#
-    );
+    let preamble = build_preamble(config, &agents);
 
     let mut context_compacted = false;
+    // Set once any agent call in this run returns successfully. Handed to the
+    // policy's final-answer review below, which may treat an answer produced
+    // without a single successful call differently — see [`DelegationPolicy`].
+    let mut delegated = false;
 
     for turn_idx in 0..config.max_turns {
         let window = context.window();
 
+        // Restated per turn, not only in the system prompt: the turn that writes
+        // the answer is the one that has to obey a rule about HOW to answer, and
+        // this is the last text the model reads. Empty when no policy is
+        // configured, or when the policy has nothing to restate, so an
+        // unconfigured deployment's prompt is byte-identical to before.
+        let policy_reminder = config
+            .policy
+            .as_ref()
+            .and_then(|p| p.turn_reminder())
+            .unwrap_or("");
+
         let user_prompt = if turn_idx == 0 && window.summary.is_none() {
-            user_query.to_string()
+            // Turn 0 gets the reminder too. It used to be the bare query, on the
+            // assumption that turn 0 only ever plans a tool call and the answer
+            // comes later — but a turn that answers immediately lands here, and
+            // that is exactly what the HITL resume does (its own prompt tells it
+            // not to call anyone again). Observed live: a resumed email turn
+            // answered without naming the agent, with a "cite the agent" rule
+            // configured, because this branch never mentioned the rules.
+            format!("{user_query}{policy_reminder}")
         } else {
             let ctx = window.format_for_prompt();
             format!(
                 "{ctx}\n\nCurrent request: {user_query}\n\n\
                  Based on the above context and tool results, continue. \
-                 If you have enough information, respond with your final answer (no tool call)."
+                 If you have enough information, respond with your final answer (no tool call).\
+                 {policy_reminder}"
             )
         };
 
-        // Decide whether to stream or not:
-        // - First turn after tool results (turn_idx > 0): use non-streaming to capture usage
-        // - Final answer (no tools): we stream for real-time output
-        // Strategy: always try non-streaming first for tool-planning turns;
-        // if the response has no tool calls (final answer), re-issue as streaming.
-        // Optimization: on turn 0, stream directly since we don't know yet.
-        let use_non_streaming = turn_idx > 0;
+        // Keep turn 0 responsive unless policy can replace its final answer.
+        // Later turns remain buffered so final-answer review precedes delivery.
+        // Both paths capture provider usage; neither reissues a completed call.
+        let use_non_streaming = turn_idx > 0
+            || config
+                .policy
+                .as_ref()
+                .is_some_and(|p| p.buffer_every_turn());
 
         if use_non_streaming {
             let mut req = model
@@ -627,10 +859,24 @@ async fn run_stream_inner(
                 .preamble(preamble.clone())
                 .tools(tool_defs.clone());
 
+            // Nothing the policy will accept from an undelegated turn is long,
+            // and anything long is about to be discarded — so stop paying to
+            // generate it. Sized against the query, because this is also the
+            // turn that relays it into a tool call.
+            if !delegated
+                && let Some(cap) = config
+                    .policy
+                    .as_ref()
+                    .and_then(|p| p.undelegated_max_tokens(user_query.chars().count()))
+            {
+                req = req.max_tokens(cap);
+            }
+
             if let Some(temp) = config.temperature {
                 req = req.temperature(temp);
             }
 
+            let call_identity = model.call_identity(false);
             let response = match req.send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -643,21 +889,31 @@ async fn run_stream_inner(
                 }
             };
 
-            // Extract usage from raw response
-            let mut completion_tokens = None;
-            if let Some(ref usage) = response.raw_response.usage {
-                let input = usage.prompt_tokens as u64;
-                let total = usage.total_tokens as u64;
-                let output = total.saturating_sub(input);
-                completion_tokens = Some(total);
-                let _ = tx
-                    .send(OrchestratorEvent::Usage {
-                        input_tokens: input,
-                        output_tokens: output,
-                        model: config.model.clone(),
-                        estimated: false,
+            let completion_tokens = response
+                .raw_response
+                .usage
+                .as_ref()
+                .map(|usage| usage.total_tokens);
+            if let Some(usage) = response.raw_response.usage {
+                let _ = tx.send(OrchestratorEvent::Usage { usage }).await;
+            }
+
+            if completion_tokens.is_none() {
+                let output_chars = response
+                    .choice
+                    .iter()
+                    .map(|content| match content {
+                        AssistantContent::Text(text) => text.text.len(),
+                        AssistantContent::ToolCall(tool) => {
+                            tool.function.arguments.to_string().len()
+                        }
                     })
-                    .await;
+                    .sum();
+                let usage = call_identity.estimated(
+                    estimate_tokens_from_chars(preamble.len() + user_prompt.len()),
+                    estimate_tokens_from_chars(output_chars),
+                );
+                let _ = tx.send(OrchestratorEvent::Usage { usage }).await;
             }
 
             // Partition the response
@@ -704,34 +960,76 @@ async fn run_stream_inner(
                         .unwrap_or(name)
                         .replace('_', "-");
 
-                    if let Some(g) = guard
-                        && let Err(reason) = g.before_call(&agent_display).await
+                    if call_is_blocked(
+                        tc,
+                        &agent_display,
+                        config,
+                        guard,
+                        tx,
+                        turn_idx,
+                        &mut results_for_context,
+                    )
+                    .await
                     {
-                        let _ = tx
-                            .send(OrchestratorEvent::PolicyRejected {
-                                agent: agent_display.clone(),
-                                reason: reason.clone(),
-                                turn: turn_idx + 1,
-                            })
-                            .await;
-                        results_for_context.push(format!(
-                            "[{}] BLOCKED by policy: {}. Do NOT retry this agent.",
-                            name, reason
-                        ));
                         continue;
                     }
 
+                    let policy_score = config
+                        .policy
+                        .as_ref()
+                        .and_then(|p| p.call_score(&tc.function.arguments));
+                    tracing::info!(
+                        target: "nasiko::orchestrator",
+                        agent = %agent_display,
+                        policy_score = ?policy_score,
+                        turn = turn_idx + 1,
+                        "delegating to agent: the call cleared every configured gate"
+                    );
                     let _ = tx
                         .send(OrchestratorEvent::ToolCall {
                             agent: agent_display.clone(),
                             message: msg,
                             turn: turn_idx + 1,
+                            policy_score,
                         })
                         .await;
 
                     let started = std::time::Instant::now();
                     let result = toolset.call(name, args_str).await;
                     let duration_ms = started.elapsed().as_millis() as u64;
+
+                    // A pause is not a tool outcome to relay as ToolResult or reason over — stop
+                    // this run immediately, before the LLM ever sees it as a completed call.
+                    //
+                    // Do NOT also send OrchestratorEvent::AwaitingHuman here: this A2aTool was
+                    // built `.with_progress(tx.clone())` (same `tx` this function itself uses),
+                    // so `call_streaming`'s own forwarder task already relayed the identical
+                    // event on this same channel, live, before `toolset.call()` even returned —
+                    // sending it again here would deliver it twice to a2a_dispatch.rs.
+                    if let ToolOutcome::AwaitingHuman { .. } = classify_tool_result(&result) {
+                        if let Some(g) = guard {
+                            g.after_call(&agent_display, tokens_per_call).await;
+                        }
+                        // Preserve any earlier calls in this same batch that already completed
+                        // before this one paused — without this, they're silently discarded here,
+                        // since the push_tool_result call below (which normally records the whole
+                        // batch) is never reached once we return. `results_for_context.len()` is
+                        // exactly the count of `tool_calls` processed so far: every earlier
+                        // iteration either pushed a result/error/block entry or hit this same
+                        // pause check itself, so the slice lines up with what's actually recorded.
+                        if !results_for_context.is_empty() {
+                            let completed_names = tool_calls[..results_for_context.len()]
+                                .iter()
+                                .map(|tc| tc.function.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("+");
+                            context.push_tool_result(
+                                &completed_names,
+                                &results_for_context.join("\n\n"),
+                            );
+                        }
+                        return Ok(());
+                    }
 
                     match &result {
                         Ok(output) => {
@@ -748,6 +1046,7 @@ async fn run_stream_inner(
                                 })
                                 .await;
                             results_for_context.push(format!("[{}] Result: {}", name, output));
+                            delegated = true;
                         }
                         Err(e) => {
                             // Balance the before_call() depth increment even on
@@ -783,7 +1082,8 @@ async fn run_stream_inner(
                 );
             } else {
                 // Final answer from non-streaming — emit as Content chunks
-                let final_text = text_parts.join("\n");
+                let final_text =
+                    finalize_answer(&text_parts.join("\n"), config, &agents, delegated, turn_idx);
                 for chunk in final_text.chars().collect::<Vec<_>>().chunks(200) {
                     let s: String = chunk.iter().collect();
                     let _ = tx.send(OrchestratorEvent::Content { content: s }).await;
@@ -806,11 +1106,25 @@ async fn run_stream_inner(
                 .preamble(preamble.clone())
                 .tools(tool_defs.clone());
 
+            // Nothing the policy will accept from an undelegated turn is long,
+            // and anything long is about to be discarded — so stop paying to
+            // generate it. Sized against the query, because this is also the
+            // turn that relays it into a tool call.
+            if !delegated
+                && let Some(cap) = config
+                    .policy
+                    .as_ref()
+                    .and_then(|p| p.undelegated_max_tokens(user_query.chars().count()))
+            {
+                req = req.max_tokens(cap);
+            }
+
             if let Some(temp) = config.temperature {
                 req = req.temperature(temp);
             }
 
-            let mut stream = match req.stream().await {
+            let call_identity = model.call_identity(true);
+            let mut stream = match model.stream_request(req.build()).await {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = tx
@@ -825,21 +1139,18 @@ async fn run_stream_inner(
             let mut text_parts = Vec::new();
             let mut tool_calls = Vec::new();
 
+            let mut completion_tokens = None;
             while let Some(chunk) = stream.next().await {
                 match chunk {
-                    Ok(StreamingChoice::Message(text)) => {
+                    Ok(CompletionEvent::Usage(usage)) => {
+                        completion_tokens = Some(usage.total_tokens);
+                        let _ = tx.send(OrchestratorEvent::Usage { usage }).await;
+                    }
+                    Ok(CompletionEvent::Text(text)) => {
                         text_parts.push(text.clone());
                         let _ = tx.send(OrchestratorEvent::Content { content: text }).await;
                     }
-                    Ok(StreamingChoice::ToolCall(name, id, params)) => {
-                        tool_calls.push(ToolCall {
-                            id,
-                            function: ToolFunction {
-                                name,
-                                arguments: params,
-                            },
-                        });
-                    }
+                    Ok(CompletionEvent::Tool(tool)) => tool_calls.push(tool),
                     Err(e) => {
                         let _ = tx
                             .send(OrchestratorEvent::Error {
@@ -851,10 +1162,8 @@ async fn run_stream_inner(
                 }
             }
 
-            // rig 0.11's stream surfaces no usage chunk, so streamed turns would
-            // otherwise report nothing at all. Emit a character-based estimate,
-            // flagged so consumers label it approximate rather than exact.
-            {
+            // Missing provider usage is not evidence of zero usage or cache misses.
+            if completion_tokens.is_none() {
                 let output_chars: usize = text_parts.iter().map(|t| t.len()).sum::<usize>()
                     + tool_calls
                         .iter()
@@ -863,10 +1172,10 @@ async fn run_stream_inner(
                 let input_chars = preamble.len() + user_prompt.len();
                 let _ = tx
                     .send(OrchestratorEvent::Usage {
-                        input_tokens: estimate_tokens_from_chars(input_chars),
-                        output_tokens: estimate_tokens_from_chars(output_chars),
-                        model: config.model.clone(),
-                        estimated: true,
+                        usage: call_identity.estimated(
+                            estimate_tokens_from_chars(input_chars),
+                            estimate_tokens_from_chars(output_chars),
+                        ),
                     })
                     .await;
             }
@@ -877,11 +1186,7 @@ async fn run_stream_inner(
                 // delivered live via `Content` as it streamed above, so
                 // re-sending it as `Thinking` would just print it twice.
 
-                // The estimated Usage above is for display/attribution only; no
-                // exact figure exists to feed `after_call`, so token-budget
-                // accounting stays 0 for streamed turns only. Budget enforcement
-                // is still real for every turn after the first (turn_idx > 0
-                // always takes the non-streaming path).
+                let tokens_per_call = tokens_per_tool_call(completion_tokens, tool_calls.len());
                 let mut results_for_context = Vec::new();
 
                 for tc in &tool_calls {
@@ -901,28 +1206,37 @@ async fn run_stream_inner(
                         .unwrap_or(name)
                         .replace('_', "-");
 
-                    if let Some(g) = guard
-                        && let Err(reason) = g.before_call(&agent_display).await
+                    if call_is_blocked(
+                        tc,
+                        &agent_display,
+                        config,
+                        guard,
+                        tx,
+                        turn_idx,
+                        &mut results_for_context,
+                    )
+                    .await
                     {
-                        let _ = tx
-                            .send(OrchestratorEvent::PolicyRejected {
-                                agent: agent_display.clone(),
-                                reason: reason.clone(),
-                                turn: turn_idx + 1,
-                            })
-                            .await;
-                        results_for_context.push(format!(
-                            "[{}] BLOCKED by policy: {}. Do NOT retry this agent.",
-                            name, reason
-                        ));
                         continue;
                     }
 
+                    let policy_score = config
+                        .policy
+                        .as_ref()
+                        .and_then(|p| p.call_score(&tc.function.arguments));
+                    tracing::info!(
+                        target: "nasiko::orchestrator",
+                        agent = %agent_display,
+                        policy_score = ?policy_score,
+                        turn = turn_idx + 1,
+                        "delegating to agent: the call cleared every configured gate"
+                    );
                     let _ = tx
                         .send(OrchestratorEvent::ToolCall {
                             agent: agent_display.clone(),
                             message: msg,
                             turn: turn_idx + 1,
+                            policy_score,
                         })
                         .await;
 
@@ -930,10 +1244,43 @@ async fn run_stream_inner(
                     let result = toolset.call(name, args_str).await;
                     let duration_ms = started.elapsed().as_millis() as u64;
 
+                    // A pause is not a tool outcome to relay as ToolResult or reason over — stop
+                    // this run immediately, before the LLM ever sees it as a completed call.
+                    //
+                    // Do NOT also send OrchestratorEvent::AwaitingHuman here: this A2aTool was
+                    // built `.with_progress(tx.clone())` (same `tx` this function itself uses),
+                    // so `call_streaming`'s own forwarder task already relayed the identical
+                    // event on this same channel, live, before `toolset.call()` even returned —
+                    // sending it again here would deliver it twice to a2a_dispatch.rs.
+                    if let ToolOutcome::AwaitingHuman { .. } = classify_tool_result(&result) {
+                        if let Some(g) = guard {
+                            g.after_call(&agent_display, tokens_per_call).await;
+                        }
+                        // Preserve any earlier calls in this same batch that already completed
+                        // before this one paused — without this, they're silently discarded here,
+                        // since the push_tool_result call below (which normally records the whole
+                        // batch) is never reached once we return. `results_for_context.len()` is
+                        // exactly the count of `tool_calls` processed so far: every earlier
+                        // iteration either pushed a result/error/block entry or hit this same
+                        // pause check itself, so the slice lines up with what's actually recorded.
+                        if !results_for_context.is_empty() {
+                            let completed_names = tool_calls[..results_for_context.len()]
+                                .iter()
+                                .map(|tc| tc.function.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("+");
+                            context.push_tool_result(
+                                &completed_names,
+                                &results_for_context.join("\n\n"),
+                            );
+                        }
+                        return Ok(());
+                    }
+
                     match &result {
                         Ok(output) => {
                             if let Some(g) = guard {
-                                g.after_call(&agent_display, 0).await;
+                                g.after_call(&agent_display, tokens_per_call).await;
                             }
                             let _ = tx
                                 .send(OrchestratorEvent::ToolResult {
@@ -945,6 +1292,7 @@ async fn run_stream_inner(
                                 })
                                 .await;
                             results_for_context.push(format!("[{}] Result: {}", name, output));
+                            delegated = true;
                         }
                         Err(e) => {
                             // Balance the before_call() depth increment even on
@@ -952,7 +1300,7 @@ async fn run_stream_inner(
                             // leaks flow-depth and later legitimate calls in the
                             // same flow get falsely rejected with MaxDepthExceeded.
                             if let Some(g) = guard {
-                                g.after_call(&agent_display, 0).await;
+                                g.after_call(&agent_display, tokens_per_call).await;
                             }
                             let err_str = e.to_string();
                             let _ = tx
@@ -979,7 +1327,21 @@ async fn run_stream_inner(
                     &combined,
                 );
             } else {
-                // Final answer — already streamed token-by-token via Content events
+                // Final answer — already streamed token-by-token via Content events.
+                //
+                // No policy review here, and none is possible: the text has
+                // already reached the client chunk-by-chunk and cannot be
+                // recalled. A policy whose `review_final_answer` can change an
+                // answer must therefore return `true` from `buffer_every_turn`,
+                // which forces `use_non_streaming` above and makes this branch
+                // unreachable under it.
+                //
+                // Note the condition is "can change an answer", not "enforces
+                // something": a policy that rewrites only some turns still has
+                // to buffer all of them, because this branch cannot ask. That
+                // distinction is not academic — the enterprise policy returned
+                // `require_delegation` here, so the HITL resume streamed turn 0
+                // and silently skipped its own final-answer review.
                 let final_text = text_parts.join("");
                 context.push_assistant(&final_text);
 
@@ -1037,5 +1399,393 @@ mod tokens_per_tool_call_tests {
     #[test]
     fn single_tool_call_gets_the_full_amount() {
         assert_eq!(tokens_per_tool_call(Some(150), 1), 150);
+    }
+}
+
+#[cfg(test)]
+mod awaiting_human_tests {
+    use super::*;
+    use crate::a2a::A2aClient;
+    use crate::registry::{AgentInfo, RegistrySource};
+    use crate::tool::A2aToolError;
+
+    fn input_required_response_body() -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {"task": {
+                "id": "task-321",
+                "contextId": "ctx-654",
+                "status": {
+                    "state": "TASK_STATE_INPUT_REQUIRED",
+                    "message": {"parts": [{"text": "Which repository?"}]}
+                }
+            }}
+        })
+        .to_string()
+    }
+
+    /// Pure classification, exercised twice with identical input — the property that makes the
+    /// "both loops call the same function" claim actually checkable rather than asserted by
+    /// inspection: if this function's output ever depended on anything but its argument, the two
+    /// calls below could disagree.
+    #[test]
+    fn classify_tool_result_is_deterministic_and_recovers_awaiting_human_through_rig_erasure() {
+        // Built the same way `ToolSet::call()` really builds it (see
+        // tool::tests::awaiting_human_survives_rig_toolset_erasure for the full round trip
+        // through a real ToolSet; this test targets classify_tool_result directly).
+        let inner: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(A2aToolError::AwaitingHuman {
+                agent: "test-agent".into(),
+                agent_id: "agent-under-test".into(),
+                pause: PauseInfo {
+                    kind: nasiko_types::a2a::AwaitingHumanKind::InputRequired,
+                    message: "Which repository?".into(),
+                    task_id: "task-321".into(),
+                    context_id: "ctx-654".into(),
+                    metadata: serde_json::Value::Null,
+                },
+            });
+        let result: Result<String, ToolSetError> =
+            Err(ToolSetError::ToolCallError(ToolError::ToolCallError(inner)));
+
+        for _ in 0..2 {
+            match classify_tool_result(&result) {
+                ToolOutcome::AwaitingHuman {
+                    agent, agent_id, ..
+                } => {
+                    assert_eq!(agent, "test-agent");
+                    assert_eq!(agent_id, "agent-under-test");
+                }
+                ToolOutcome::NotAwaitingHuman => panic!("expected AwaitingHuman"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_tool_result_leaves_ordinary_outcomes_alone() {
+        assert!(matches!(
+            classify_tool_result(&Ok("fine".to_string())),
+            ToolOutcome::NotAwaitingHuman
+        ));
+        assert!(matches!(
+            classify_tool_result(&Err(ToolSetError::ToolNotFoundError("x".into()))),
+            ToolOutcome::NotAwaitingHuman
+        ));
+    }
+
+    fn test_agent(endpoint: &str) -> AgentInfo {
+        AgentInfo {
+            id: "agent-under-test".into(),
+            name: "test-agent".into(),
+            description: "for tests".into(),
+            endpoint: endpoint.into(),
+            skills: vec![],
+        }
+    }
+
+    fn mock_tool_call_completion() -> String {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "call_agent_test_agent",
+                            "arguments": "{\"message\":\"hi\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string()
+    }
+
+    /// The real, end-to-end proof this whole step exists for: a full `Orchestrator::run()`
+    /// against a mocked LLM (one tool-call completion) and a mocked sub-agent (pauses) —
+    /// verifies the loop stops after exactly one LLM call, never asks the LLM what to do next
+    /// with the pause, and returns the pause faithfully.
+    #[tokio::test]
+    async fn run_stops_after_one_llm_call_when_the_tool_call_pauses() {
+        let mut llm_server = mockito::Server::new_async().await;
+        let llm_mock = llm_server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(mock_tool_call_completion())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut agent_server = mockito::Server::new_async().await;
+        let agent_mock = agent_server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(input_required_response_body())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let config = OrchestratorConfig {
+            base_url: Some(llm_server.url()),
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let mut orchestrator = Orchestrator::new(
+            config,
+            RegistrySource::Static(vec![test_agent(&agent_server.url())]),
+        )
+        .with_a2a_client(A2aClient::new());
+        // AgentRegistry::agents() only reads its cache — init() is what populates it, even for a
+        // Static source. Every real caller (e.g. a2a_dispatch.rs) calls this before run()/
+        // run_stream(); omitting it here isn't "a smaller test," it's testing a call sequence
+        // that doesn't happen in production and getting Err(NoAgents) for the wrong reason.
+        orchestrator
+            .init()
+            .await
+            .expect("registry init must succeed for a Static source");
+
+        let result = orchestrator.run("please help").await;
+
+        llm_mock.assert_async().await;
+        agent_mock.assert_async().await;
+        match result {
+            Err(OrchestratorError::AwaitingHuman {
+                agent,
+                agent_id,
+                pause,
+            }) => {
+                assert_eq!(agent, "test-agent");
+                assert_eq!(agent_id, "agent-under-test");
+                assert_eq!(pause.message, "Which repository?");
+            }
+            other => panic!("expected Err(AwaitingHuman), got {other:?}"),
+        }
+    }
+
+    /// The stable roster/protocol/rules block must stay the prefix and `{custom}` (e.g. L1A
+    /// supplemental context, which can be query-variable for large domains) must come last, so
+    /// OpenAI's prefix-based prompt caching hits on the stable part across turns even when
+    /// `{custom}` itself changes. See `build_preamble`'s doc comment.
+    #[test]
+    fn build_preamble_places_custom_content_after_the_stable_roster_and_rules() {
+        let config = OrchestratorConfig {
+            preamble: Some("## Known facts about specific agents\n\ntest-agent:\n- a fact".into()),
+            ..Default::default()
+        };
+        let agents = vec![test_agent("http://unused")];
+
+        // The free function, not a method: `run()` and `run_stream_inner()` used to carry
+        // byte-identical copies of this prompt, and this is the single builder both now call.
+        let preamble = build_preamble(&config, &agents);
+
+        let agents_pos = preamble
+            .find("## Available Agents")
+            .expect("roster header present");
+        let rules_pos = preamble.find("## Rules").expect("rules header present");
+        let custom_pos = preamble
+            .find("Known facts about specific agents")
+            .expect("custom preamble content present");
+
+        assert!(
+            agents_pos < rules_pos,
+            "roster must precede rules in the stable prefix"
+        );
+        assert!(
+            rules_pos < custom_pos,
+            "custom content must come after the stable roster/protocol/rules block"
+        );
+    }
+}
+
+#[cfg(test)]
+mod policy_seam_tests {
+    use super::*;
+    use crate::policy::ToolSchemaExtra;
+
+    /// Records which hooks the loop actually reaches, and answers every one of
+    /// them with something recognisable. Asserting on the *effects* here is what
+    /// makes this a test of the seam rather than of a policy: the behaviour it
+    /// checks belongs to whatever implementation is plugged in, but the wiring
+    /// belongs to this crate, and a hook that quietly stops being called is
+    /// invisible any other way.
+    #[derive(Debug)]
+    struct StubPolicy;
+
+    impl DelegationPolicy for StubPolicy {
+        fn preamble_policy(&self) -> String {
+            "## Stub Policy".to_string()
+        }
+        fn preamble_footer(&self) -> String {
+            "## Stub Footer".to_string()
+        }
+        fn turn_reminder(&self) -> Option<&str> {
+            Some("\n\n(stub reminder)")
+        }
+        fn tool_schema_extra(&self) -> Option<ToolSchemaExtra> {
+            None
+        }
+        fn check_tool_call(&self, arguments: &serde_json::Value) -> Result<(), String> {
+            match arguments.get("ok") {
+                Some(serde_json::Value::Bool(true)) => Ok(()),
+                _ => Err("stub rejected this call".to_string()),
+            }
+        }
+        fn call_score(&self, _arguments: &serde_json::Value) -> Option<f64> {
+            Some(42.0)
+        }
+        fn review_final_answer(
+            &self,
+            _text: &str,
+            _agents: &[AgentInfo],
+            _delegated: bool,
+            _turn_idx: usize,
+        ) -> String {
+            "stub replaced the answer".to_string()
+        }
+        fn undelegated_max_tokens(&self, user_query_chars: usize) -> Option<u64> {
+            Some(123 + user_query_chars as u64)
+        }
+        fn buffer_every_turn(&self) -> bool {
+            true
+        }
+        fn is_refusal(&self, text: &str) -> bool {
+            text == "stub replaced the answer"
+        }
+    }
+
+    fn with_policy() -> OrchestratorConfig {
+        OrchestratorConfig {
+            policy: Some(Arc::new(StubPolicy)),
+            ..Default::default()
+        }
+    }
+
+    /// The open-source default: no policy, and the prompt carries no trace of
+    /// one. This is the guarantee that makes the seam free to exist here — an
+    /// unconfigured deployment is byte-identical to one built before it.
+    #[test]
+    fn no_policy_leaves_the_preamble_untouched() {
+        let preamble = build_preamble(&OrchestratorConfig::default(), &[]);
+
+        // Byte-exact, NOT trimmed. An earlier version of this test trimmed, and
+        // so could not see that the two empty placeholders were each leaving a
+        // stray blank line behind — "the same apart from whitespace" is not the
+        // same prompt. Both joins are pinned literally: an empty roster renders
+        // as `Agents\n\n` + `` + `\n\n` + `Protocol`, exactly as it did before
+        // this seam existed, and the built-in rules are the last thing in the
+        // string with nothing after them.
+        assert!(
+            preamble.contains("## Available Agents\n\n\n\n## Protocol"),
+            "an absent policy section must leave nothing behind, not a blank line:\n{preamble:?}"
+        );
+        assert!(
+            preamble.ends_with("your own words would otherwise repeat the same question twice."),
+            "an absent footer must leave nothing behind, not a trailing blank line:\n{preamble:?}"
+        );
+    }
+
+    /// Both variable sections render after the stable block, and the footer is
+    /// last of all.
+    ///
+    /// The order between them is a real trade-off, resolved here rather than
+    /// left to whoever edits the format string next. `{custom}` is the more
+    /// variable of the two, so prompt-cache reasoning alone would put the
+    /// footer first — but the footer is the operator's org rules, whose whole
+    /// value depends on being the last thing the model reads, and `{custom}`
+    /// grows with the size of the fleet. Putting the rules first would re-bury
+    /// them behind it, which is the failure they were moved to the footer to
+    /// escape in the first place.
+    #[test]
+    fn the_footer_stays_last_even_behind_caller_supplied_context() {
+        let config = OrchestratorConfig {
+            preamble: Some("## Known facts about specific agents".into()),
+            policy: Some(Arc::new(StubPolicy)),
+            ..Default::default()
+        };
+        let preamble = build_preamble(&config, &[]);
+
+        let rules_at = preamble.find("## Rules").expect("built-in rules");
+        let custom_at = preamble
+            .find("## Known facts about specific agents")
+            .expect("caller preamble");
+        let footer_at = preamble.find("## Stub Footer").expect("policy footer");
+
+        assert!(
+            rules_at < custom_at,
+            "caller context belongs after the stable block:\n{preamble}"
+        );
+        assert!(
+            custom_at < footer_at,
+            "the operator's footer must outrank caller context for last place:\n{preamble}"
+        );
+        assert!(
+            preamble.ends_with("## Stub Footer"),
+            "nothing may render after the footer:\n{preamble:?}"
+        );
+    }
+
+    #[test]
+    fn no_policy_returns_the_model_answer_verbatim() {
+        let out = finalize_answer(
+            "Paris is the capital of France.",
+            &OrchestratorConfig::default(),
+            &[],
+            false,
+            0,
+        );
+        assert_eq!(out, "Paris is the capital of France.");
+    }
+
+    /// Position is the whole reason these are two hooks rather than one: the
+    /// policy section explains the roster it follows, while the footer has to be
+    /// the last thing the model reads to survive at all.
+    #[test]
+    fn a_policy_lands_in_both_prompt_positions_in_order() {
+        let preamble = build_preamble(&with_policy(), &[]);
+
+        let policy_at = preamble.find("## Stub Policy").expect("policy section");
+        let protocol_at = preamble.find("## Protocol").expect("protocol section");
+        let footer_at = preamble.find("## Stub Footer").expect("footer section");
+
+        assert!(policy_at < protocol_at, "policy precedes the protocol");
+        assert!(footer_at > protocol_at, "the footer trails every built-in");
+        assert!(preamble.trim_end().ends_with("## Stub Footer"));
+    }
+
+    #[test]
+    fn a_policy_gets_the_last_word_on_the_final_answer() {
+        let out = finalize_answer(
+            "Paris is the capital of France.",
+            &with_policy(),
+            &[],
+            false,
+            0,
+        );
+        assert_eq!(out, "stub replaced the answer");
+    }
+
+    /// The gate reads raw arguments, before deserialization, so a rejection is
+    /// an explicit reason the model can act on rather than an opaque JSON error.
+    #[test]
+    fn the_gate_sees_raw_tool_arguments() {
+        let policy = StubPolicy;
+        assert!(
+            policy
+                .check_tool_call(&serde_json::json!({"ok": true}))
+                .is_ok()
+        );
+        let err = policy
+            .check_tool_call(&serde_json::json!({"message": "hi"}))
+            .expect_err("the stub rejects anything without ok=true");
+        assert_eq!(err, "stub rejected this call");
     }
 }

@@ -100,6 +100,19 @@ pub enum OciError {
     Forbidden(String),
 }
 
+/// Carries a storage failure across the trait seam without the registry
+/// needing to know which backend produced it: absence keeps the 404 the
+/// Distribution Spec requires, and a backend fault keeps the 500 whose detail
+/// reaches the log but never the wire.
+impl From<nasiko_runtime::BlobStoreError> for OciError {
+    fn from(e: nasiko_runtime::BlobStoreError) -> Self {
+        match e {
+            nasiko_runtime::BlobStoreError::NotFound(m) => Self::NotFound(m),
+            nasiko_runtime::BlobStoreError::Backend(m) => Self::Storage(m),
+        }
+    }
+}
+
 impl OciError {
     /// Convenience constructors for the codes used most.
     pub fn manifest_unknown(msg: impl Into<String>) -> Self {
@@ -177,3 +190,40 @@ impl IntoResponse for OciError {
 }
 
 pub type Result<T> = std::result::Result<T, OciError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nasiko_runtime::BlobStoreError;
+
+    // The whole point of the storage trait seam is that a backend swap cannot
+    // change what the wire sees. These pin the two classifications that decide
+    // it: absence must stay a spec-required 404, and a backend fault must stay
+    // a 500 whose detail never leaves the log.
+    #[test]
+    fn absent_blob_keeps_the_404_code_across_the_seam() {
+        let e: OciError = BlobStoreError::NotFound("blob sha256:abc not found".into()).into();
+        assert!(matches!(e, OciError::NotFound(_)));
+        assert_eq!(e.code().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn backend_fault_keeps_the_500_and_its_detail_never_reaches_the_wire() {
+        let detail = "SignatureDoesNotMatch: the request signature we calculated does not match";
+        let e: OciError = BlobStoreError::Backend(detail.into()).into();
+        assert!(matches!(e, OciError::Storage(_)));
+        // Display is what the operator reads in the log — it must keep the cause.
+        assert!(e.to_string().contains("SignatureDoesNotMatch"));
+
+        let resp = e.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        // ...and the registry client must not: a backend credential error is
+        // not a registry client's business.
+        assert!(!body.contains("SignatureDoesNotMatch"), "leaked: {body}");
+        assert!(body.contains("storage error"));
+    }
+}

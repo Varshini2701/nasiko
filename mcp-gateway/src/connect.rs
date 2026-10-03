@@ -242,7 +242,11 @@ async fn resolve_target(
 }
 
 /// Composio OAuth connect: reuse an active/pending connection or initiate a new one.
-async fn composio_connect(
+/// `pub(crate)`: also called directly by `protocol.rs`'s `handle_auth_required` to mint a
+/// real, clickable re-auth link for an inline HITL pause, without `connect_service`'s extra
+/// `can_access_connector` re-check / `grant_user_agents_access` side effects — the caller
+/// there already knows the connector is real and already reachable by this call.
+pub(crate) async fn composio_connect(
     state: &McpState,
     user_id: Uuid,
     connector: &McpConnector,
@@ -491,6 +495,31 @@ pub async fn handle_composio_callback(
             }
             grant_user_agents_access(&state.db, user_id, connector_id).await;
             session::invalidate_session_cache(state, user_id).await;
+            // Same auto-resolve hook as the generic OAuth2 callback
+            // (`oauth.rs::handle_callback`) — a Composio connector going
+            // ACTIVE is just as much "the credential now works" as a
+            // generic connector's token exchange succeeding.
+            match nasiko_hitl::repo::resolve_pending_auth_required_for_connector(
+                &state.db,
+                user_id,
+                connector_id,
+            )
+            .await
+            {
+                Ok(resolved) if !resolved.is_empty() => {
+                    tracing::info!(
+                        connector = %connector.name, %user_id, resolved_count = resolved.len(),
+                        "auto-resolved pending auth_required hitl requests after composio callback"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e, connector = %connector.name, %user_id,
+                        "failed to auto-resolve pending auth_required hitl requests"
+                    );
+                }
+            }
             match success_url {
                 // Explicit success_url — redirect there (never off-origin).
                 Some(dest) => CallbackOutcome::Redirect(crate::net::safe_redirect(

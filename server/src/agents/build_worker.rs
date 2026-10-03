@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::agent_lifecycle::SwappableAgentDeletionHook;
 use crate::state::AppState;
 
 const MAX_ATTEMPTS: i32 = 3;
@@ -23,13 +25,16 @@ use crate::build::routes::execute_build;
 /// A job targets exactly one of an agent or an MCP connector — enforced by
 /// `chk_build_jobs_one_target` (`038_mcp_connector_uploads.sql`), so `agent_id`
 /// and `connector_id` are never both `Some`.
+///
+/// `pub` alongside [`claim_next_job`], so an integration test can assert *which*
+/// job a claim returned rather than only that one was returned.
 #[derive(Debug, sqlx::FromRow)]
-struct BuildJob {
-    id: Uuid,
-    agent_id: Option<Uuid>,
-    connector_id: Option<Uuid>,
-    payload: serde_json::Value,
-    attempt: i32,
+pub struct BuildJob {
+    pub id: Uuid,
+    pub agent_id: Option<Uuid>,
+    pub connector_id: Option<Uuid>,
+    pub payload: serde_json::Value,
+    pub attempt: i32,
 }
 
 /// Main build worker loop. Spawned once at server startup.
@@ -41,43 +46,39 @@ struct BuildJob {
 /// catch jobs left `in_progress` by a crashed replica — without this, a multi-replica
 /// cluster where no replica restarts would leave stuck jobs stranded indefinitely.
 ///
-/// After each successful claim, drains the queue immediately before sleeping
-/// to avoid a 5-second lag when multiple jobs arrive in a burst.
+/// Drains the queue immediately after each wake-up rather than sleeping between
+/// jobs, so a burst of uploads doesn't pay the 5-second poll lag per job.
+///
+/// Up to `config.build_concurrency` jobs run at once. Two jobs for the *same*
+/// agent or connector never overlap — [`claim_next_job`] skips a target that
+/// already has a build in flight.
 pub async fn run(state: AppState, mut notify: mpsc::Receiver<()>) {
-    recover_stuck_jobs(&state.db).await;
+    recover_stuck_jobs(&state.db, &[], &state.agent_deletion_hook).await;
 
     // First tick fires after the interval, not immediately — startup already ran recovery.
     let recovery_start = tokio::time::Instant::now() + Duration::from_secs(10 * 60);
     let mut recovery_tick = tokio::time::interval_at(recovery_start, Duration::from_secs(10 * 60));
     recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    tracing::info!("build worker: started");
+    // Config clamps this to 1..=16, but the field is a plain `usize` that test
+    // and bench harnesses set by struct literal — a 0 would make the drain loop
+    // body unreachable and silently park the worker forever.
+    let concurrency = state.config.build_concurrency.max(1);
+    let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // Jobs executing right now, so the recovery sweep doesn't reset one of them
+    // out from under us. Shared with each spawned task, which clears its own id.
+    let in_flight: Arc<Mutex<HashSet<Uuid>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    tracing::info!(concurrency, "build worker: started");
     loop {
-        tokio::select! {
-            msg = notify.recv() => {
-                if msg.is_none() {
-                    // Sender was dropped — server is shutting down.
-                    tracing::info!("build worker: notification channel closed, exiting");
-                    return;
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-            _ = recovery_tick.tick() => {
-                recover_stuck_jobs(&state.db).await;
-                // Fall through to the drain loop: recovered jobs are now pending.
-            }
-        }
-        // Drain: keep claiming jobs until the queue is empty.
-        // Claim runs in the outer task (minimal, no panic risk).
-        // Execute runs in a spawned task for panic isolation.
-        // Separating the two means we always have the job_id available in the panic arm,
-        // enabling immediate reset instead of waiting up to STUCK_JOB_MINS.
-        loop {
-            // Phase 1: claim (no panic risk — just DB reads/writes)
-            let job = match claim_next_job(&state).await {
+        // Drain: claim while there is a free slot and the queue has a claimable job.
+        // Claim runs here in the worker loop (minimal, no panic risk); execute runs
+        // in a spawned task so a panicking build can't take the worker down.
+        while tasks.len() < concurrency {
+            let job = match claim_next_job(&state.db).await {
                 Ok(Some(j)) => j,
                 Ok(None) => {
-                    tracing::debug!("build worker: queue empty");
+                    tracing::debug!("build worker: nothing claimable");
                     break;
                 }
                 Err(e) => {
@@ -98,7 +99,7 @@ pub async fn run(state: AppState, mut notify: mpsc::Receiver<()>) {
                 // without this call the target would stay in a non-terminal state forever
                 // with no path back (RUN-4, extended to MCP connectors).
                 if let Some(agent_id) = job.agent_id {
-                    fail_agent_terminal(&state.db, agent_id).await;
+                    fail_agent_terminal(&state.db, agent_id, &state.agent_deletion_hook).await;
                 } else if let Some(connector_id) = job.connector_id {
                     crate::mcp::build::fail_mcp_connector_terminal(&state.db, connector_id).await;
                 }
@@ -106,17 +107,59 @@ pub async fn run(state: AppState, mut notify: mpsc::Receiver<()>) {
                 continue; // try next job
             }
 
-            // Phase 2: execute in a spawned task (panic-isolated)
             let state_clone = state.clone();
-            match tokio::task::spawn(async move { execute_claimed_job(state_clone, job).await })
-                .await
-            {
-                Ok(()) => {} // job finished (success or failure recorded in DB by execute_claimed_job)
-                Err(ref e) if e.is_panic() => {
-                    tracing::error!(job_id = %job_id, "build worker: job panicked — resetting immediately");
-                    reset_panicked_job(&state.db, job_id, old_attempt).await;
+            let db = state.db.clone();
+            let deletion_hook = state.agent_deletion_hook.clone();
+            let in_flight_task = in_flight.clone();
+            in_flight
+                .lock()
+                .expect("in-flight set poisoned")
+                .insert(job_id);
+            tasks.spawn(async move {
+                // Nested spawn keeps the panic-isolation contract: job_id and
+                // old_attempt stay in scope here, so a panicking build resets
+                // immediately instead of waiting out STUCK_JOB_MINS. The outer
+                // task only awaits and writes to the DB — it can't itself panic.
+                match tokio::task::spawn(execute_claimed_job(state_clone, job)).await {
+                    // Job finished; success or failure already recorded in the DB
+                    // by execute_claimed_job.
+                    Ok(()) => {}
+                    Err(ref e) if e.is_panic() => {
+                        tracing::error!(job_id = %job_id, "build worker: job panicked — resetting immediately");
+                        reset_panicked_job(&db, job_id, old_attempt, &deletion_hook).await;
+                    }
+                    // Only reachable if the inner task is aborted, which nothing
+                    // does — dropping its handle detaches rather than cancels.
+                    Err(_) => {}
                 }
-                Err(_) => break, // task cancelled (server shutdown)
+                in_flight_task
+                    .lock()
+                    .expect("in-flight set poisoned")
+                    .remove(&job_id);
+            });
+        }
+
+        tokio::select! {
+            // A slot freed up — loop back and refill it without waiting for the poll.
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
+            msg = notify.recv() => {
+                if msg.is_none() {
+                    // Sender was dropped — server is shutting down. Return without
+                    // draining: in-flight jobs stay 'in_progress' and are re-queued by
+                    // recover_stuck_jobs on the next boot, exactly as they are today
+                    // when the runtime aborts them. Awaiting them instead could block
+                    // for a full build_timeout (30 min) only to be killed at the pod's
+                    // termination grace period.
+                    tracing::info!(in_flight = tasks.len(), "build worker: notification channel closed, exiting");
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            _ = recovery_tick.tick() => {
+                let running: Vec<Uuid> =
+                    in_flight.lock().expect("in-flight set poisoned").iter().copied().collect();
+                recover_stuck_jobs(&state.db, &running, &state.agent_deletion_hook).await;
+                // Fall through to the drain loop: recovered jobs are now pending.
             }
         }
     }
@@ -128,7 +171,20 @@ pub async fn run(state: AppState, mut notify: mpsc::Receiver<()>) {
 /// replica are recovered without requiring a server restart.
 /// The `make_interval` form keeps the threshold in one place rather than
 /// embedding it as a string literal in two separate SQL statements.
-async fn recover_stuck_jobs(db: &PgPool) {
+///
+/// `in_flight` holds the jobs this worker is currently executing, and they are
+/// excluded from both statements. While the worker was serial the sweep could
+/// never observe its own running job — the loop was blocked awaiting it — but a
+/// concurrent worker returns to `select!` immediately, so a legitimately slow
+/// build (execute + deploy can outlast `STUCK_JOB_MINS`) would otherwise be
+/// reset to `pending`, re-claimed, and run a second time against the same image
+/// tag: exactly what `claim_next_job`'s same-target clause exists to prevent.
+/// Jobs from *other* replicas can't be vouched for this way and are still swept.
+async fn recover_stuck_jobs(
+    db: &PgPool,
+    in_flight: &[Uuid],
+    deletion_hook: &Arc<SwappableAgentDeletionHook>,
+) {
     // Permanently fail exhausted jobs (>= MAX_ATTEMPTS attempts already made).
     // RETURNING agent_id, connector_id so we can also drive the target to a
     // terminal state (RUN-4, extended to MCP connectors) — otherwise its
@@ -136,17 +192,19 @@ async fn recover_stuck_jobs(db: &PgPool) {
     match sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
         "UPDATE build_jobs SET status = 'failed', error_msg = 'max attempts exceeded', completed_at = now()
          WHERE status = 'in_progress' AND picked_at < now() - make_interval(mins => $2::int) AND attempt >= $1
+           AND id <> ALL($3)
          RETURNING agent_id, connector_id",
     )
     .bind(MAX_ATTEMPTS)
     .bind(STUCK_JOB_MINS)
+    .bind(in_flight)
     .fetch_all(db)
     .await
     {
         Ok(rows) => {
             for (agent_id, connector_id) in rows {
                 if let Some(agent_id) = agent_id {
-                    fail_agent_terminal(db, agent_id).await;
+                    fail_agent_terminal(db, agent_id, deletion_hook).await;
                 } else if let Some(connector_id) = connector_id {
                     crate::mcp::build::fail_mcp_connector_terminal(db, connector_id).await;
                 }
@@ -158,10 +216,12 @@ async fn recover_stuck_jobs(db: &PgPool) {
     // Reset remaining stuck jobs so they get another try.
     match sqlx::query(
         "UPDATE build_jobs SET status = 'pending', picked_at = NULL
-         WHERE status = 'in_progress' AND picked_at < now() - make_interval(mins => $2::int) AND attempt < $1",
+         WHERE status = 'in_progress' AND picked_at < now() - make_interval(mins => $2::int) AND attempt < $1
+           AND id <> ALL($3)",
     )
     .bind(MAX_ATTEMPTS)
     .bind(STUCK_JOB_MINS)
+    .bind(in_flight)
     .execute(db)
     .await
     {
@@ -178,19 +238,82 @@ async fn recover_stuck_jobs(db: &PgPool) {
 /// Claim one pending job from the queue.
 ///
 /// Sets status to `in_progress` and increments attempt within a transaction.
-/// Returns `Ok(None)` if the queue is empty. The returned `job.attempt` is the
-/// pre-increment value; the DB now holds `attempt + 1`.
-async fn claim_next_job(state: &AppState) -> anyhow::Result<Option<BuildJob>> {
-    let mut tx = state.db.begin().await?;
+/// Returns `Ok(None)` if the queue holds nothing claimable. The returned
+/// `job.attempt` is the pre-increment value; the DB now holds `attempt + 1`.
+///
+/// `FOR UPDATE SKIP LOCKED` stops two claimers taking the *same* row, across
+/// this worker's slots and across replicas.
+///
+/// The same-target clause below reads committed state, so on its own it would
+/// leave a window across replicas: a claim transaction that has not yet
+/// committed is invisible to another replica's subquery, so both could claim
+/// siblings of one target. The advisory lock closes that by serializing the
+/// read-then-write per target, which is why the two clauses are both needed.
+///
+/// `pub` (not `pub(crate)`) so the same-target clause is directly testable from
+/// an integration test — same reasoning as [`infer_build_status`]. Takes the
+/// pool rather than `AppState` because that is all it touches, which also lets
+/// a test drive it against a bare migrated database with no worker running.
+pub async fn claim_next_job(db: &PgPool) -> anyhow::Result<Option<BuildJob>> {
+    let mut tx = db.begin().await?;
 
+    // The NOT EXISTS clause serializes per target. Two builds of the same agent
+    // resolve to the same `image_tag` (`agents::build_image_tag` is
+    // name + version) and would deploy the same container_id, so running them
+    // concurrently makes the surviving image nondeterministic. The serial
+    // worker used to prevent this implicitly; with build_concurrency > 1 it has
+    // to be explicit.
+    //
+    // Skipped, not failed: the row stays 'pending' and is claimed on a later
+    // drain pass once its in-flight sibling finishes.
+    //
+    // Bounded by STUCK_JOB_MINS so an orphan can't block a target forever: a
+    // replica SIGKILLed mid-build leaves an 'in_progress' row nobody will ever
+    // complete, and without this bound every later build of that agent would
+    // wait for the recovery sweep to clear it. Past the threshold the row is
+    // about to be swept anyway, so it stops counting as a live sibling.
+    //
+    // NOT EXISTS rather than NOT IN: `=` is NULL-safe, so a job targeting an
+    // agent is never blocked by an in-flight connector job (and vice versa)
+    // without needing IS NOT NULL guards. Every row sets exactly one of the two
+    // columns — enforced by `chk_build_jobs_one_target`.
+    //
+    // The advisory lock makes the same-target rule hold across replicas too.
+    // NOT EXISTS reads committed state, so two replicas can both pass it before
+    // either commits; taking a lock keyed on the target id serializes the
+    // read-then-write, and the loser's subquery then sees the winner's
+    // 'in_progress' row. `try_` (not the blocking form) keeps the existing
+    // semantics: a contended target yields false, the row is filtered out and
+    // stays 'pending' for the next drain, rather than holding the transaction
+    // open. The lock is released when this transaction ends, a moment later.
+    //
+    // Note the predicate runs on every candidate row the scan considers, not
+    // only the one LIMIT returns, so a busy queue briefly holds a lock per
+    // candidate. Harmless — they last until this transaction commits — but it
+    // means a concurrent replica can come up empty while work exists and pick
+    // it up on the next drain instead.
+    //
+    // The 'a:'/'c:' prefixes keep the two id spaces apart, so an agent and a
+    // connector that happened to share a UUID can't collide on one lock key.
+    // COALESCE picks whichever column is set — exactly one always is.
     let job = sqlx::query_as::<_, BuildJob>(
         "SELECT id, agent_id, connector_id, payload, attempt
-         FROM build_jobs
+         FROM build_jobs j
          WHERE status = 'pending'
-         ORDER BY created_at
+           AND NOT EXISTS (
+                 SELECT 1 FROM build_jobs b
+                 WHERE b.status = 'in_progress'
+                   AND b.picked_at > now() - make_interval(mins => $1::int)
+                   AND (b.agent_id = j.agent_id OR b.connector_id = j.connector_id)
+               )
+           AND pg_try_advisory_xact_lock(
+                 hashtext(coalesce('a:' || j.agent_id::text, 'c:' || j.connector_id::text))
+               )
+         ORDER BY created_at, id
          FOR UPDATE SKIP LOCKED
          LIMIT 1",
     )
+    .bind(STUCK_JOB_MINS)
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -275,6 +398,7 @@ async fn execute_claimed_job(state: AppState, job: BuildJob) {
                 writable,
                 writable_path,
                 state.config.agent_default_memory.clone(),
+                state.agent_deletion_hook.clone(),
             )
             .await;
         }
@@ -369,7 +493,7 @@ async fn execute_claimed_job(state: AppState, job: BuildJob) {
             upload_id,
             name,
             tar_gz_path,
-            image_tag,
+            image_tag: _,
             ports,
             env,
         } => {
@@ -387,7 +511,6 @@ async fn execute_claimed_job(state: AppState, job: BuildJob) {
                 upload_id,
                 name,
                 std::path::PathBuf::from(&tar_gz_path),
-                image_tag,
                 ports,
                 platform_env,
                 state.config.openai_api_key.clone(),
@@ -396,6 +519,14 @@ async fn execute_claimed_job(state: AppState, job: BuildJob) {
                 state.config.agent_image_registry.clone(),
                 state.config.agent_max_replicas,
                 state.config.agent_default_memory.clone(),
+                None,
+                // This legacy job variant is never actually enqueued
+                // anymore (superseded by `GithubClone`), so there's no
+                // snapshot to restore on a version conflict.
+                None,
+                None,
+                None,
+                state.agent_deletion_hook.clone(),
             )
             .await;
         }
@@ -498,6 +629,10 @@ async fn execute_claimed_job(state: AppState, job: BuildJob) {
                 state.config.mcp_description_model.clone(),
             )
             .await;
+            // Rebuild search index so newly synced tools are discoverable.
+            if let Err(e) = state.mcp.search_index.rebuild(&state.db).await {
+                tracing::warn!(%e, "search index rebuild after MCP build failed");
+            }
         }
     }
 
@@ -537,7 +672,12 @@ async fn execute_claimed_job(state: AppState, job: BuildJob) {
 /// `old_attempt` is the pre-increment value from the claim. The DB now holds `old_attempt + 1`.
 /// If that value is at or above `MAX_ATTEMPTS`, the job is permanently failed;
 /// otherwise it is reset to `pending` for immediate retry.
-async fn reset_panicked_job(db: &PgPool, job_id: Uuid, old_attempt: i32) {
+async fn reset_panicked_job(
+    db: &PgPool,
+    job_id: Uuid,
+    old_attempt: i32,
+    deletion_hook: &Arc<SwappableAgentDeletionHook>,
+) {
     if old_attempt >= MAX_ATTEMPTS {
         mark_job(db, job_id, "failed", Some("job panicked during execution")).await;
         // Also terminalize the agent/connector so any waiting SSE/poll stops (RUN-4,
@@ -551,7 +691,7 @@ async fn reset_panicked_job(db: &PgPool, job_id: Uuid, old_attempt: i32) {
             .await
         {
             if let Some(agent_id) = agent_id {
-                fail_agent_terminal(db, agent_id).await;
+                fail_agent_terminal(db, agent_id, deletion_hook).await;
             } else if let Some(connector_id) = connector_id {
                 crate::mcp::build::fail_mcp_connector_terminal(db, connector_id).await;
             }
@@ -578,7 +718,11 @@ async fn reset_panicked_job(db: &PgPool, job_id: Uuid, old_attempt: i32) {
 /// rather than set to `status='failed'`, so no orphaned record is left. For existing
 /// agents that exceeded max attempts on an update/rollback the row is kept (the caller
 /// may still want to redeploy or inspect history).
-async fn fail_agent_terminal(db: &PgPool, agent_id: Uuid) {
+async fn fail_agent_terminal(
+    db: &PgPool,
+    agent_id: Uuid,
+    deletion_hook: &Arc<SwappableAgentDeletionHook>,
+) {
     let _ = sqlx::query(
         "UPDATE agent_builds SET status = 'failed', updated_at = now() \
          WHERE agent_id = $1 AND status = 'building'",
@@ -586,7 +730,7 @@ async fn fail_agent_terminal(db: &PgPool, agent_id: Uuid) {
     .bind(agent_id)
     .execute(db)
     .await;
-    super::utils::delete_agent_or_mark_failed(db, agent_id).await;
+    super::utils::delete_agent_or_mark_failed(db, agent_id, deletion_hook).await;
 }
 
 /// Reads the terminal status of `build_id` from whichever `*_builds` table

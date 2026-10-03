@@ -78,9 +78,18 @@ impl RepoWatchAgent {
         // `CompletionsClient` (the classic `/chat/completions` shape), not the default
         // `openai::Client` (OpenAI's newer Responses API) — DeepSeek and other
         // OpenAI-compatible providers implement the former, not the latter.
+        // Forward the inbound trace context as a W3C `traceparent` default header so the
+        // LLM gateway can attribute these completions to the originating user flow.
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(tp) = remote_cx.and_then(telemetry::traceparent_for_context)
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(&tp)
+        {
+            headers.insert("traceparent", value);
+        }
         let client = openai::CompletionsClient::builder()
             .api_key(&self.api_key)
             .base_url(&self.base_url)
+            .http_headers(headers)
             .build()
             .map_err(|e| format!("LLM client setup failed: {e}"))?;
         let model = client.completion_model(&self.model);

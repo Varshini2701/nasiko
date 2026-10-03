@@ -82,6 +82,10 @@ impl InfraAgent {
                 gen_ai.input.messages = tracing::field::Empty,
                 gen_ai.output.messages = tracing::field::Empty,
             );
+            // Capture the W3C traceparent before parent_cx is moved into
+            // set_parent below; the outbound LLM call needs it so the gateway
+            // can attribute tokens to the originating user flow.
+            let traceparent = parent_cx.as_ref().and_then(telemetry::traceparent_for_context);
             if let Some(cx) = parent_cx {
                 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
                 chat_span.set_parent(cx);
@@ -103,9 +107,13 @@ impl InfraAgent {
                 "stream_options": {"include_usage": true},
             });
 
-            let resp = match http
+            let mut req = http
                 .post(format!("{base_url}/chat/completions"))
-                .bearer_auth(&api_key)
+                .bearer_auth(&api_key);
+            if let Some(tp) = traceparent {
+                req = req.header("traceparent", tp);
+            }
+            let resp = match req
                 .json(&body)
                 .send()
                 .await

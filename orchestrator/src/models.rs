@@ -113,6 +113,11 @@ pub struct AgentSelection {
 pub struct SkillSummary {
     pub name: String,
     pub description: String,
+    /// The AgentCard's own `examples` — the literal inputs this skill expects. Carried, not
+    /// dropped, because a planner that only sees a name and a description has to invent the
+    /// wording it delegates with, and a skill keyed on an exact phrase then never fires.
+    #[serde(default)]
+    pub examples: Vec<String>,
 }
 
 /// Simplified agent card used in LLM routing prompts

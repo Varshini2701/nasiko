@@ -17,7 +17,7 @@ impl LLMProvider {
     // `chat_completion`/`chat_completion_stream`
     /// hardcode a `/v1` segment; a caller-supplied `OPENAI_BASE_URL` that
     /// already ends in `/v1` (a common way to write it, and how
-    /// `ee/server/.env` has it) would otherwise double up into
+    /// typical deployment env files have it) would otherwise double up into
     /// `.../v1/v1/chat/completions`, which 404s.
     pub fn new(client: Client, api_key: String, base_url: String) -> Self {
         Self {

@@ -6,12 +6,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bollard::Docker;
+use bollard::auth::DockerCredentials;
 use bollard::container::LogsOptions;
 use bollard::container::{
-    Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
+    Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions, LogOutput,
     RemoveContainerOptions, RestartContainerOptions, StartContainerOptions, StopContainerOptions,
     WaitContainerOptions,
 };
+use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::{BuildImageOptions, CreateImageOptions, ImportImageOptions};
 use bollard::models::{
     ContainerStateStatusEnum, HostConfig, Mount, MountTypeEnum, MountVolumeOptions, PortBinding,
@@ -26,8 +28,8 @@ use crate::{
     ContainerRuntime, ImageSource,
     error::{Result, RuntimeError},
     types::{
-        ContainerId, DeploymentSpec, DeploymentStatus, InstanceInfo, RuntimeState,
-        validate_build_inputs,
+        ContainerId, DeploymentSpec, DeploymentStatus, InstanceInfo, RuntimeState, WorkspaceEntry,
+        WorkspaceFile, WorkspaceRef, validate_build_inputs,
     },
 };
 
@@ -56,6 +58,15 @@ pub struct DockerRuntimeConfig {
     /// When set, images that don't already include a registry host are pulled from here first.
     /// Default: `None` (use Docker's local cache / Docker Hub).
     pub registry_host: Option<String>,
+    /// Username for authenticating pulls of a private image (e.g. a private
+    /// Docker Hub repo). `None` (the default) means every pull is anonymous —
+    /// unchanged behavior for public images. Only meaningful together with
+    /// `registry_password`; bollard needs both or neither.
+    pub registry_username: Option<String>,
+    /// Password or access token paired with `registry_username`. Read once at
+    /// startup from server config — never logged, never echoed back in any
+    /// API response.
+    pub registry_password: Option<String>,
     /// Name of the single named Docker volume every `--writable` agent shares
     /// (each mounted at a different `volume-subpath`, keyed by `container_id` —
     /// see [`DeploymentSpec::writable`](crate::types::DeploymentSpec::writable)).
@@ -65,8 +76,8 @@ pub struct DockerRuntimeConfig {
     /// `--writable` agent's subdirectory inside `agent_memory_volume` (Docker,
     /// unlike Kubernetes' `subPath`, does not create it automatically). Must
     /// have `mkdir` on its `PATH`. Default: `"alpine:3.21"` — override for
-    /// air-gapped or internal mirror setups (mirrors `ee/k8s-runtime`'s
-    /// `build_init_image` config, same rationale).
+    /// air-gapped or internal mirror setups (mirrors the Kubernetes runtime's
+    /// init-image config, same rationale).
     pub agent_memory_init_image: String,
 }
 
@@ -78,6 +89,8 @@ impl Default for DockerRuntimeConfig {
             operation_timeout: Duration::from_secs(30),
             build_timeout: Duration::from_secs(30 * 60),
             registry_host: None,
+            registry_username: None,
+            registry_password: None,
             agent_memory_volume: "nasiko-agent-memory".to_owned(),
             agent_memory_init_image: "alpine:3.21".to_owned(),
         }
@@ -155,12 +168,39 @@ impl DockerRuntime {
         format!("nasiko-agent-{}", id.as_str())
     }
 
+    /// Build the registry credentials for image pulls from config, when both
+    /// halves are set. `None` (either field unset) means anonymous pulls —
+    /// unchanged behavior for public images.
+    fn registry_credentials(&self) -> Option<DockerCredentials> {
+        let username = self.config.registry_username.clone()?;
+        let password = self.config.registry_password.clone()?;
+        Some(DockerCredentials {
+            username: Some(username),
+            password: Some(password),
+            ..Default::default()
+        })
+    }
+
     /// Extract the agent ID from a container name, stripping the leading `/` that
     /// Docker adds and the `nasiko-agent-` prefix.
     fn container_id_from_name(name: &str) -> Option<ContainerId> {
         // Docker names arrive as "/nasiko-agent-{id}" from the list API
         let stripped = name.strip_prefix('/').unwrap_or(name);
         stripped.strip_prefix("nasiko-agent-").map(ContainerId::new)
+    }
+
+    /// Bring up the shared workspace-reader container if it isn't already.
+    /// Called on every workspace request — one local `inspect_container` — so a
+    /// daemon restart or a manual `docker rm` self-heals on the next read
+    /// instead of needing a control-plane restart.
+    async fn ensure_workspace_reader(&self) -> Result<()> {
+        ensure_workspace_reader(
+            &self.client,
+            self.config.operation_timeout,
+            &self.config.agent_memory_volume,
+            &self.config.agent_memory_init_image,
+        )
+        .await
     }
 
     /// Idempotently ensures a bridge network named `name` exists. Called once at
@@ -256,6 +296,18 @@ fn is_not_modified(err: &bollard::errors::Error) -> bool {
         err,
         bollard::errors::Error::DockerResponseServerError {
             status_code: 304,
+            ..
+        }
+    )
+}
+
+/// Returns true for HTTP 409 (Conflict) — e.g. creating a container whose name
+/// another request already took.
+fn is_conflict(err: &bollard::errors::Error) -> bool {
+    matches!(
+        err,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
             ..
         }
     )
@@ -377,10 +429,35 @@ fn agent_memory_subpath(spec: &DeploymentSpec) -> String {
     format!("{}/{}", spec.owner_id, spec.container_id.as_str())
 }
 
-/// Builds the `HostConfig` for a container, applying OS-level hardening
-/// (read-only rootfs, dropped capabilities, no-new-privileges) when
-/// `spec.harden` is set — see `DeploymentSpec::harden`'s doc comment. Pure and
-/// hermetically testable: no Docker client involved.
+/// The `user` a container runs as: the conventional "nobody" uid:gid for fully
+/// hardened agents, otherwise whatever the image declares (root for most).
+///
+/// `--writable` agents deliberately keep the image's user (typically root):
+/// read-only root already confines their writes to the `/workspace` mount and
+/// `/tmp` tmpfs, and running as root lets them write into the volume subdir
+/// without depending on a deploy-time `chown` (Docker has no `fsGroup`, and the
+/// image may declare its own non-65534 user). `KubeRuntime` uses `fsGroup: 65534`
+/// to solve the same problem the other way; each runtime is internally
+/// consistent, and the workspace reader only ever reads world-readable files.
+fn run_as_user(spec: &DeploymentSpec) -> Option<String> {
+    spec.harden.then(|| "65534:65534".to_owned())
+}
+
+/// Builds the `HostConfig` for a container. `spec.harden` or `spec.writable`
+/// both get **filesystem** hardening — read-only rootfs plus a `/tmp` tmpfs;
+/// only full `spec.harden` additionally drops capabilities and sets
+/// no-new-privileges. Pure and hermetically testable: no Docker client involved.
+///
+/// `writable` takes the filesystem half because otherwise the two runtimes
+/// disagree about where a stray write lands. `KubeRuntime` gives every writable
+/// pod a read-only root, so an agent that writes an absolute path outside its
+/// mount fails loudly there — while on Docker the same write silently landed on
+/// the ephemeral container layer and was lost on the next restart, the opposite
+/// of what `--writable` promises. Read-only root makes `/workspace` (or the
+/// `--writable-path`) plus `/tmp` the only writable locations, which makes the
+/// promise true — but it does *not* drop capabilities, because `--writable` is
+/// about *where* writes land, not privilege reduction, and some agents shell
+/// out to tools that need those capabilities.
 fn build_host_config(
     spec: &DeploymentSpec,
     port_bindings: PortBindingsMap,
@@ -420,16 +497,29 @@ fn build_host_config(
         mounts,
         ..Default::default()
     };
-    if spec.harden {
-        HostConfig {
-            readonly_rootfs: Some(true),
-            tmpfs: Some(HashMap::from([("/tmp".to_owned(), "size=64m".to_owned())])),
-            cap_drop: Some(vec!["ALL".to_owned()]),
-            security_opt: Some(vec!["no-new-privileges:true".to_owned()]),
-            ..base
-        }
-    } else {
-        base
+    if !spec.harden && !spec.writable {
+        return base;
+    }
+    HostConfig {
+        // Read-only root for both: it is what makes `/workspace` (or the
+        // `--writable-path`) plus `/tmp` the *only* writable locations, so a
+        // stray write to the image filesystem fails loudly instead of silently
+        // landing on the ephemeral layer and being lost on the next restart.
+        readonly_rootfs: Some(true),
+        // The `/tmp` tmpfs comes along for writable too: without a writable
+        // `/tmp`, read-only root breaks agents that use it at runtime (opencode,
+        // the coding/claude-sdk agents). `KubeRuntime` gives writable pods an
+        // `emptyDir` `/tmp` for the same reason.
+        tmpfs: Some(HashMap::from([("/tmp".to_owned(), "size=64m".to_owned())])),
+        // Capability/privilege hardening is full-`--harden` only. `--writable`
+        // is about *where writes land*, not dropping capabilities — some agents
+        // shell out to tools (cargo/git/rustc) that need them, and read-only
+        // root already delivers the write-confinement `--writable` promises.
+        cap_drop: spec.harden.then(|| vec!["ALL".to_owned()]),
+        security_opt: spec
+            .harden
+            .then(|| vec!["no-new-privileges:true".to_owned()]),
+        ..base
     }
 }
 
@@ -541,21 +631,21 @@ fn extract_endpoint(
     {
         for ep_net in nets.values() {
             let ip = ep_net.ip_address.as_deref().filter(|ip| !ip.is_empty());
-            if let Some(ip) = ip {
-                if let Some(ports) = ns.ports.as_ref() {
-                    let mut keys: Vec<&String> = ports.keys().collect();
-                    keys.sort_by_key(|k| {
-                        k.split('/')
-                            .next()
-                            .and_then(|p| p.parse::<u16>().ok())
-                            .unwrap_or(0)
-                    });
-                    for key in &keys {
-                        if let Some(container_port) =
-                            key.split('/').next().and_then(|p| p.parse::<u16>().ok())
-                        {
-                            return Some(format!("http://{ip}:{container_port}"));
-                        }
+            if let Some(ip) = ip
+                && let Some(ports) = ns.ports.as_ref()
+            {
+                let mut keys: Vec<&String> = ports.keys().collect();
+                keys.sort_by_key(|k| {
+                    k.split('/')
+                        .next()
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .unwrap_or(0)
+                });
+                for key in &keys {
+                    if let Some(container_port) =
+                        key.split('/').next().and_then(|p| p.parse::<u16>().ok())
+                    {
+                        return Some(format!("http://{ip}:{container_port}"));
                     }
                 }
             }
@@ -605,13 +695,22 @@ async fn create_and_start(
     network: Option<&str>,
     timeout: Duration,
     registry_host: Option<&str>,
+    registry_credentials: Option<&DockerCredentials>,
     image_source: Option<&dyn ImageSource>,
     agent_memory_volume: &str,
     agent_memory_init_image: &str,
 ) -> Result<()> {
     let name = DockerRuntime::container_name(&spec.container_id);
 
-    ensure_image_present(client, &spec.image, registry_host, image_source).await?;
+    ensure_image_present(
+        client,
+        &spec.image,
+        registry_host,
+        registry_credentials,
+        image_source,
+        spec.force_pull,
+    )
+    .await?;
 
     if spec.writable {
         ensure_agent_memory_subdir(
@@ -624,11 +723,18 @@ async fn create_and_start(
         .await?;
     }
 
-    let env_vec: Vec<String> = spec
-        .env_vars
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
+    // The writable directory *is* the agent's HOME. Agents that keep state or
+    // cache under `$HOME` (opencode, most CLIs) then write it into the persistent
+    // mount instead of the image filesystem — which, under read-only root, is the
+    // difference between working and crashing on a `mkdir $HOME`. Only defaulted:
+    // an explicit `HOME` in the caller's env still wins.
+    let mut env_map = spec.env_vars.clone();
+    if spec.writable {
+        env_map
+            .entry("HOME".to_owned())
+            .or_insert_with(|| spec.writable_mount_path().to_owned());
+    }
+    let env_vec: Vec<String> = env_map.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
     let (port_bindings, exposed_ports) = build_port_config(&spec.ports, bind_host);
 
@@ -640,9 +746,7 @@ async fn create_and_start(
     let env_json = serde_json::to_string(&spec.env_vars).unwrap_or_default();
     let labels = HashMap::from([(ENV_VARS_LABEL.to_owned(), env_json)]);
 
-    // Conventional "nobody" uid:gid — same value `ee/k8s-runtime` uses for its
-    // non-root pod security context, kept consistent across editions.
-    let user = spec.harden.then(|| "65534:65534".to_owned());
+    let user = run_as_user(spec);
 
     let config = Config {
         image: Some(spec.image.clone()),
@@ -700,9 +804,21 @@ async fn create_and_start(
 /// does not create the target directory itself — attempting to mount a
 /// not-yet-existing one fails outright (verified against a real daemon).
 ///
-/// Runs a short-lived helper container (`init_image`, must have `mkdir` on
-/// `PATH`) that mounts the *whole* volume (no subpath) and creates `subdir`
-/// inside it. `create_volume` is idempotent — safe to call on every deploy.
+/// Runs a short-lived helper container (`init_image`, must have `sh`, `mkdir`,
+/// `stat` and `chown` on `PATH`) that mounts the *whole* volume (no subpath)
+/// and creates `subdir` inside it. `create_volume` is idempotent — safe to call
+/// on every deploy.
+///
+/// It also hands the directory to uid 65534, the uid `--writable` agents run
+/// as (see `build_host_config`). Docker has no `fsGroup`, so this is the
+/// analogue of the pod-level `fsGroup: 65534` the Kubernetes runtime sets: a
+/// kubelet/daemon-created directory is root-owned, which a non-root agent
+/// cannot write to. The `chown` is guarded on the directory's current owner
+/// rather than run unconditionally — the same reasoning as Kubernetes'
+/// `fsGroupChangePolicy: OnRootMismatch`, since the recursive walk is O(files)
+/// and would otherwise be paid on every single deploy. It runs once: on the
+/// first deploy after this uid change, migrating whatever the agent wrote back
+/// when it ran as root.
 async fn ensure_agent_memory_subdir(
     client: &Docker,
     timeout: Duration,
@@ -722,7 +838,7 @@ async fn ensure_agent_memory_subdir(
     .map_err(map_bollard_err)?;
 
     if client.inspect_image(init_image).await.is_err() {
-        pull_image(client, init_image, None).await?;
+        pull_image(client, init_image, None, None).await?;
     }
 
     // Named per-agent (not a fixed name) so two different agents' first
@@ -740,11 +856,7 @@ async fn ensure_agent_memory_subdir(
 
     let config = Config {
         image: Some(init_image.to_owned()),
-        cmd: Some(vec![
-            "mkdir".to_owned(),
-            "-p".to_owned(),
-            format!("/data/{subdir}"),
-        ]),
+        cmd: Some(agent_memory_init_cmd(subdir)),
         host_config: Some(HostConfig {
             mounts: Some(vec![Mount {
                 target: Some("/data".to_owned()),
@@ -813,6 +925,22 @@ async fn ensure_agent_memory_subdir(
     }
 }
 
+/// The init helper's argv: prepare the agent's subdirectory — create it and hand
+/// it to uid 65534. The body is [`crate::types::WORKSPACE_SETUP_SCRIPT`], shared
+/// with `KubeRuntime`'s writable initContainer so both backends lay the directory
+/// out identically.
+fn agent_memory_init_cmd(subdir: &str) -> Vec<String> {
+    vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        // `$1`, not string interpolation: the path is data to the shell, never
+        // code, so nothing in a subdirectory name can be executed.
+        crate::types::WORKSPACE_SETUP_SCRIPT.to_owned(),
+        "_".to_owned(),
+        format!("/data/{subdir}"),
+    ]
+}
+
 /// Force-removes the agent-memory init helper container, ignoring any error
 /// (it may never have been created, or already be gone) — best-effort cleanup,
 /// never itself a reason to fail the deploy.
@@ -828,16 +956,299 @@ async fn remove_memory_init_helper(client: &Docker, name: &str) {
         .await;
 }
 
+// ── Workspace reader ───────────────────────────────────────────────────────────
+
+/// Name of the single long-lived helper container that reads every agent's
+/// `--writable` directory. One per daemon, not one per request: starting a
+/// container per download would put its start latency in front of every click,
+/// and N concurrent downloads would mean N containers.
+const WORKSPACE_READER_NAME: &str = "nasiko-workspace-reader";
+
+/// Cap on how many files one `list_workspace` call reports. The volume is
+/// 20Gi-scale, so an agent that writes a deep tree must not turn a UI request
+/// into an unbounded response.
+const WORKSPACE_LIST_LIMIT: usize = 5_000;
+
+/// Ensures the workspace-reader container exists and is running, so
+/// `list_workspace`/`read_workspace_file` have somewhere to exec.
+///
+/// It mounts the *whole* agent-memory volume (no `volume-subpath`) **read-only**
+/// at `/data`, which is what lets one container serve every agent and what makes
+/// reads work while the agent itself is stopped, destroyed or crash-looping. The
+/// read-only mount is the guarantee that a helper with a shell can never mutate
+/// an agent's data; per-agent scoping is enforced by the caller, which is the
+/// only thing that builds the path.
+///
+/// Idempotent, and self-healing across daemon restarts: an existing-but-stopped
+/// container is started rather than recreated.
+async fn ensure_workspace_reader(
+    client: &Docker,
+    timeout: Duration,
+    volume: &str,
+    image: &str,
+) -> Result<()> {
+    match client
+        .inspect_container(WORKSPACE_READER_NAME, None::<InspectContainerOptions>)
+        .await
+    {
+        Ok(info) => {
+            let running = info
+                .state
+                .as_ref()
+                .and_then(|st| st.status)
+                .is_some_and(|st| st == ContainerStateStatusEnum::RUNNING);
+            if running {
+                return Ok(());
+            }
+            // Left over from a daemon restart. Starting beats recreating — the
+            // container holds no state of its own.
+            let started = tokio::time::timeout(
+                timeout,
+                client
+                    .start_container(WORKSPACE_READER_NAME, None::<StartContainerOptions<String>>),
+            )
+            .await;
+            match started {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(e)) if is_not_modified(&e) => return Ok(()),
+                // Wedged in a state we can't revive; rebuild it below.
+                _ => {
+                    let _ = client
+                        .remove_container(
+                            WORKSPACE_READER_NAME,
+                            Some(RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
+                }
+            }
+        }
+        Err(e) if is_not_found(&e) => {}
+        Err(e) => return Err(map_bollard_err(e)),
+    }
+
+    if client.inspect_image(image).await.is_err() {
+        pull_image(client, image, None, None).await?;
+    }
+
+    let config = Config {
+        image: Some(image.to_owned()),
+        // Idles until exec'd into. `sleep infinity` is busybox-supported.
+        cmd: Some(vec!["sleep".to_owned(), "infinity".to_owned()]),
+        host_config: Some(HostConfig {
+            mounts: Some(vec![Mount {
+                target: Some(WORKSPACE_READER_MOUNT.to_owned()),
+                source: Some(volume.to_owned()),
+                typ: Some(MountTypeEnum::VOLUME),
+                read_only: Some(true),
+                ..Default::default()
+            }]),
+            // Nothing here needs the network, and a container holding every
+            // agent's files should not be able to reach one.
+            network_mode: Some("none".to_owned()),
+            readonly_rootfs: Some(true),
+            cap_drop: Some(vec!["ALL".to_owned()]),
+            // Reading *any* agent's file is the job, and agents run as uid
+            // 65534 with whatever umask they choose — a restrictive one would
+            // otherwise be unreadable here. `DAC_READ_SEARCH` grants exactly
+            // that and nothing else: bypass read permission, never write. The
+            // mount above is read-only, so this cannot become a write path,
+            // and which file gets read is decided by the caller, not here.
+            cap_add: Some(vec!["DAC_READ_SEARCH".to_owned()]),
+            security_opt: Some(vec!["no-new-privileges:true".to_owned()]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let created = tokio::time::timeout(
+        timeout,
+        client.create_container(
+            Some(CreateContainerOptions {
+                name: WORKSPACE_READER_NAME,
+                platform: None,
+            }),
+            config,
+        ),
+    )
+    .await
+    .map_err(|_| RuntimeError::Timeout("create_container (workspace reader)".to_owned()))?;
+
+    // 409 means a concurrent request won the race — its container serves just
+    // as well as ours would have.
+    if let Err(e) = created
+        && !is_conflict(&e)
+    {
+        return Err(map_bollard_err(e));
+    }
+
+    match tokio::time::timeout(
+        timeout,
+        client.start_container(WORKSPACE_READER_NAME, None::<StartContainerOptions<String>>),
+    )
+    .await
+    .map_err(|_| RuntimeError::Timeout("start_container (workspace reader)".to_owned()))?
+    {
+        Ok(()) => Ok(()),
+        Err(e) if is_not_modified(&e) || is_conflict(&e) => Ok(()),
+        Err(e) => Err(map_bollard_err(e)),
+    }
+}
+
+/// Where the agent-memory volume is mounted inside the workspace reader.
+const WORKSPACE_READER_MOUNT: &str = "/data";
+
+/// Runs `cmd` in the workspace reader and returns its stdout, failing if the
+/// command exits non-zero (stderr is folded into the error).
+///
+/// `cmd` is an argv vector, never a shell string — where a shell is genuinely
+/// needed the path is passed as a positional parameter (`sh -c '…' _ "$path"`)
+/// so it is data to the shell, not code.
+async fn exec_capture(client: &Docker, timeout: Duration, cmd: Vec<String>) -> Result<String> {
+    let exec = client
+        .create_exec(
+            WORKSPACE_READER_NAME,
+            CreateExecOptions {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                cmd: Some(cmd),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(map_bollard_err)?;
+
+    let collect = async {
+        let StartExecResults::Attached { mut output, .. } = client
+            .start_exec(&exec.id, None)
+            .await
+            .map_err(map_bollard_err)?
+        else {
+            return Err(RuntimeError::Internal(
+                "workspace reader: exec detached unexpectedly".to_owned(),
+            ));
+        };
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        while let Some(chunk) = output.next().await {
+            match chunk.map_err(map_bollard_err)? {
+                LogOutput::StdOut { message } => stdout.extend_from_slice(&message),
+                LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
+                _ => {}
+            }
+        }
+        Ok::<_, RuntimeError>((stdout, stderr))
+    };
+
+    let (stdout, stderr) = tokio::time::timeout(timeout, collect)
+        .await
+        .map_err(|_| RuntimeError::Timeout("workspace reader exec".to_owned()))??;
+
+    // Only meaningful after the output stream has drained.
+    let code = client
+        .inspect_exec(&exec.id)
+        .await
+        .map_err(map_bollard_err)?
+        .exit_code
+        .unwrap_or(0);
+    if code != 0 {
+        return Err(RuntimeError::Internal(format!(
+            "workspace reader exited {code}: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// Streams `cmd`'s stdout out of the workspace reader without buffering it.
+///
+/// Anything the command writes to stderr aborts the stream: the caller has
+/// already stat'd the file, so stderr here means the read failed partway and a
+/// truncated body would be silently wrong.
+async fn exec_stream(
+    client: &Docker,
+    cmd: Vec<String>,
+) -> Result<futures_util::stream::BoxStream<'static, Result<bytes::Bytes>>> {
+    let exec = client
+        .create_exec(
+            WORKSPACE_READER_NAME,
+            CreateExecOptions {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                cmd: Some(cmd),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(map_bollard_err)?;
+
+    let StartExecResults::Attached { output, .. } = client
+        .start_exec(&exec.id, None)
+        .await
+        .map_err(map_bollard_err)?
+    else {
+        return Err(RuntimeError::Internal(
+            "workspace reader: exec detached unexpectedly".to_owned(),
+        ));
+    };
+
+    Ok(output
+        .map(|chunk| match chunk.map_err(map_bollard_err)? {
+            LogOutput::StdOut { message } => Ok(message),
+            LogOutput::StdErr { message } => Err(RuntimeError::Internal(format!(
+                "workspace reader: {}",
+                String::from_utf8_lossy(&message).trim()
+            ))),
+            _ => Ok(bytes::Bytes::new()),
+        })
+        .boxed())
+}
+
+/// Parses `find … -exec stat -c '%s %n'` output into entries whose paths are
+/// relative to `dir`. Malformed lines are skipped rather than failing the whole
+/// listing — one odd filename should not hide every other file from the user.
+fn parse_workspace_listing(stdout: &str, dir: &str) -> Vec<WorkspaceEntry> {
+    let prefix = format!("{dir}/");
+    stdout
+        .lines()
+        .filter_map(|line| {
+            // `stat -c '%Y %s %n'` — mtime, size, then the path (which may itself
+            // contain spaces, so it must be the final, un-split field).
+            let mut parts = line.splitn(3, ' ');
+            let mtime: i64 = parts.next()?.parse().ok()?;
+            let size: u64 = parts.next()?.parse().ok()?;
+            let path = parts.next()?.strip_prefix(&prefix)?;
+            Some(WorkspaceEntry {
+                path: path.to_owned(),
+                size,
+                mtime,
+            })
+        })
+        .take(WORKSPACE_LIST_LIMIT)
+        .collect()
+}
+
 /// Make `image` available in the daemon's local cache: a no-op when already
 /// present (local dev builds it via `docker build`), then a `docker load`
 /// from `image_source` when one is wired, and a registry pull as the last
 /// resort.
+///
+/// `force_pull` skips all of that and goes straight to the registry — the
+/// difference between "reuse whatever's cached" and "get what the tag
+/// currently points to right now," which matters for a mutable tag like
+/// `:latest` that the daemon may have cached from a now-stale earlier pull.
 async fn ensure_image_present(
     client: &Docker,
     image: &str,
     registry_host: Option<&str>,
+    registry_credentials: Option<&DockerCredentials>,
     image_source: Option<&dyn ImageSource>,
+    force_pull: bool,
 ) -> Result<()> {
+    if force_pull {
+        return pull_image(client, image, registry_host, registry_credentials).await;
+    }
     if client.inspect_image(image).await.is_ok() {
         return Ok(());
     }
@@ -846,7 +1257,7 @@ async fn ensure_image_present(
     {
         return Ok(());
     }
-    pull_image(client, image, registry_host).await
+    pull_image(client, image, registry_host, registry_credentials).await
 }
 
 /// `docker load` the image from `source`. Every failure degrades to the pull
@@ -884,17 +1295,32 @@ async fn load_image_from_source(client: &Docker, image: &str, source: &dyn Image
     loaded
 }
 
-async fn pull_image(client: &Docker, image: &str, registry_host: Option<&str>) -> Result<()> {
-    // Prefer the registry-qualified ref when a registry_host is configured.
+async fn pull_image(
+    client: &Docker,
+    image: &str,
+    registry_host: Option<&str>,
+    registry_credentials: Option<&DockerCredentials>,
+) -> Result<()> {
+    // Qualify with the configured registry only when the ref does not already
+    // name one of its own.
+    //
+    // The guard used to be `!image.starts_with(host)`, which only recognised a
+    // ref already qualified with THIS registry. A ref qualified with a
+    // DIFFERENT one sailed past it and got a second host bolted on the front:
+    // with OCI_REGISTRY_HOST=localhost:8443 and an agent image of
+    // `localhost:5050/weave-dashboard-generator:v1`, the daemon was asked for
+    // `localhost:8443/localhost:5050/weave-dashboard-generator:v1`. It fails
+    // as a pull error, which reads as a missing image — the one thing it is
+    // not, since the image pulls by hand.
     let pull_ref = match registry_host {
-        Some(host) if !image.starts_with(host) => format!("{host}/{image}"),
+        Some(host) if !has_registry_host(image) => format!("{host}/{image}"),
         _ => image.to_owned(),
     };
     let opts = CreateImageOptions {
         from_image: pull_ref.as_str(),
         ..Default::default()
     };
-    let mut stream = client.create_image(Some(opts), None, None);
+    let mut stream = client.create_image(Some(opts), None, registry_credentials.cloned());
     while let Some(res) = stream.next().await {
         if let Err(e) = res {
             return Err(RuntimeError::ImageNotFound(format!(
@@ -922,6 +1348,23 @@ async fn tag_as_bare_ref(client: &Docker, pull_ref: &str, image: &str) -> Result
         )
         .await
         .map_err(|e| RuntimeError::ImageNotFound(format!("tag {pull_ref} as {image} failed: {e}")))
+}
+
+/// Whether an image reference already names a registry.
+///
+/// Docker's own rule, and the only one that works: the first path segment is a
+/// registry host when it contains a `.` or a `:`, or is exactly `localhost`.
+/// Everything else is a Docker Hub namespace — `nasiko/echo-agent:v1` — which
+/// is precisely what a configured `registry_host` exists to qualify.
+///
+/// `seed.rs::extract_name` already carries this knowledge, in a comment about
+/// registry hosts commonly having their own port. It was true there and absent
+/// here, and the gap cost a working deployment.
+fn has_registry_host(image: &str) -> bool {
+    match image.split_once('/') {
+        Some((first, _)) => first == "localhost" || first.contains('.') || first.contains(':'),
+        None => false,
+    }
 }
 
 /// Split `repo:tag` on the tag separator; a `:` inside the last path segment
@@ -1011,6 +1454,7 @@ impl ContainerRuntime for DockerRuntime {
             .network_override
             .as_deref()
             .or(self.config.network.as_deref());
+        let registry_credentials = self.registry_credentials();
 
         match tokio::time::timeout(
             timeout,
@@ -1029,6 +1473,7 @@ impl ContainerRuntime for DockerRuntime {
                     self.config.network.as_deref(),
                     timeout,
                     self.config.registry_host.as_deref(),
+                    registry_credentials.as_ref(),
                     self.image_source.as_deref(),
                     &self.config.agent_memory_volume,
                     &self.config.agent_memory_init_image,
@@ -1053,7 +1498,12 @@ impl ContainerRuntime for DockerRuntime {
                     .is_none_or(|stored| stored != spec.env_vars);
 
                 if existing_image == spec.image && !env_changed {
-                    // Same image, same env: ensure the container is running (idempotent)
+                    // Same image, same env: ensure the container is running (idempotent).
+                    // `spec.force_pull` is NOT consulted here — this branch never touches
+                    // the image cache at all. A caller that wants a fresh pull of a mutable
+                    // tag (e.g. `:latest`) must destroy the container first (as the admin
+                    // restart-with-refresh path does), landing in the "not found" branch
+                    // above instead, where `ensure_image_present` actually runs.
                     let current_status = existing.state.as_ref().and_then(|s| s.status);
 
                     if current_status != Some(ContainerStateStatusEnum::RUNNING) {
@@ -1113,6 +1563,7 @@ impl ContainerRuntime for DockerRuntime {
                         self.config.network.as_deref(),
                         timeout,
                         self.config.registry_host.as_deref(),
+                        registry_credentials.as_ref(),
                         self.image_source.as_deref(),
                         &self.config.agent_memory_volume,
                         &self.config.agent_memory_init_image,
@@ -1477,6 +1928,86 @@ impl ContainerRuntime for DockerRuntime {
             .map_err(|_| RuntimeError::Timeout("logs stream".to_owned()))?
     }
 
+    #[instrument(skip(self))]
+    async fn list_workspace(&self, workspace: &WorkspaceRef) -> Result<Vec<WorkspaceEntry>> {
+        workspace.container_id.validate()?;
+        self.ensure_workspace_reader().await?;
+
+        let dir = format!("{WORKSPACE_READER_MOUNT}/{}", workspace.subpath());
+        // An agent that has never written anything (or was never `--writable`)
+        // has no subdirectory at all — an empty listing, not an error.
+        let stdout = exec_capture(
+            &self.client,
+            self.config.operation_timeout,
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                crate::types::WORKSPACE_LIST_SCRIPT.to_owned(),
+                "_".to_owned(),
+                dir.clone(),
+            ],
+        )
+        .await?;
+
+        Ok(parse_workspace_listing(&stdout, &dir))
+    }
+
+    #[instrument(skip(self))]
+    async fn read_workspace_file(
+        &self,
+        workspace: &WorkspaceRef,
+        rel_path: &str,
+    ) -> Result<WorkspaceFile> {
+        workspace.container_id.validate()?;
+        // Defence in depth: the server validates before calling, but this is
+        // the last point before an untrusted string reaches a filesystem path.
+        crate::types::validate_workspace_relative_path(rel_path)
+            .map_err(RuntimeError::InvalidSpec)?;
+        self.ensure_workspace_reader().await?;
+
+        // The scope dir is the fence; the script joins `rel_path` onto it,
+        // resolves symlinks, and refuses anything that lands outside it. Both
+        // the stat and the cat re-apply the check, so a symlink swapped in
+        // between them still cannot escape (see `WORKSPACE_STAT_SCRIPT`).
+        let scope = format!("{WORKSPACE_READER_MOUNT}/{}", workspace.subpath());
+
+        // Stat first: it proves the file exists and is a regular file (not a
+        // directory or device), and yields the length before any bytes are
+        // committed to the response — so a missing file is a clean error rather
+        // than an empty download.
+        let size = exec_capture(
+            &self.client,
+            self.config.operation_timeout,
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                crate::types::WORKSPACE_STAT_SCRIPT.to_owned(),
+                "_".to_owned(),
+                scope.clone(),
+                rel_path.to_owned(),
+            ],
+        )
+        .await
+        .map_err(|_| RuntimeError::Internal(format!("no such file in workspace: {rel_path}")))?
+        .trim()
+        .parse::<u64>()
+        .map_err(|e| RuntimeError::Internal(format!("workspace stat: {e}")))?;
+
+        let stream = exec_stream(
+            &self.client,
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                crate::types::WORKSPACE_CAT_SCRIPT.to_owned(),
+                "_".to_owned(),
+                scope,
+                rel_path.to_owned(),
+            ],
+        )
+        .await?;
+        Ok(WorkspaceFile { size, stream })
+    }
+
     #[instrument(skip(self, tar_context), fields(image_tag))]
     async fn build(&self, tar_context: &[u8], image_tag: &str) -> Result<String> {
         validate_build_inputs(tar_context, image_tag)?;
@@ -1548,6 +2079,7 @@ mod hardening_tests {
             writable: false,
             writable_path: None,
             owner_id: uuid::Uuid::nil(),
+            force_pull: false,
         }
     }
 
@@ -1602,6 +2134,7 @@ mod writable_tests {
             writable,
             writable_path: None,
             owner_id: TEST_OWNER,
+            force_pull: false,
         }
     }
 
@@ -1623,6 +2156,70 @@ mod writable_tests {
             vol_opts.subpath.as_deref(),
             Some(format!("{TEST_OWNER}/test-agent-42").as_str())
         );
+    }
+
+    #[test]
+    fn writable_forces_workspace_to_be_the_only_writable_location() {
+        // The whole point of `--writable`: on Docker an agent that wrote an
+        // absolute path outside its mount used to hit the ephemeral container
+        // layer and lose the data on the next restart, while the same agent on
+        // Kubernetes was stopped by `readOnlyRootFilesystem`. This fixture is
+        // `harden: false`, so it pins that `writable` alone is enough.
+        let (bindings, _) = build_port_config(&[8080], "127.0.0.1");
+        let hc = build_host_config(&spec(true), bindings, "nasiko-agent-memory");
+
+        assert_eq!(hc.readonly_rootfs, Some(true));
+        // `/tmp` tmpfs comes along so read-only root doesn't break agents that
+        // write to `/tmp` at runtime.
+        assert_eq!(
+            hc.tmpfs,
+            Some(HashMap::from([("/tmp".to_owned(), "size=64m".to_owned())]))
+        );
+        // Capability/privilege hardening is full-`--harden` only, not `--writable`:
+        // `--writable` confines *writes* (read-only root), it does not drop caps.
+        assert_eq!(hc.cap_drop, None);
+        assert_eq!(hc.security_opt, None);
+        // The mount still has to survive the hardening branch, or the agent
+        // has a read-only root and nowhere to write at all.
+        assert!(hc.mounts.is_some());
+    }
+
+    #[test]
+    fn agent_memory_init_chowns_only_on_owner_mismatch() {
+        let cmd = agent_memory_init_cmd("owner-1/agent-1");
+        let script = &cmd[2];
+        // Guarded, not unconditional: the recursive walk is O(files) and would
+        // otherwise be paid on every deploy. This is Docker's stand-in for
+        // Kubernetes' `fsGroupChangePolicy: OnRootMismatch`.
+        assert!(script.contains("stat -c %u"), "{script}");
+        assert!(script.contains("chown -R 65534:65534"), "{script}");
+        // The path is a positional parameter, so a subdirectory name can never
+        // be executed as shell.
+        assert!(!script.contains("owner-1"), "{script}");
+        assert_eq!(cmd.last().unwrap(), "/data/owner-1/agent-1");
+    }
+
+    #[test]
+    fn writable_keeps_the_image_user_only_full_harden_forces_65534() {
+        // `--writable` alone keeps the image's own user (typically root): read-only
+        // root already confines writes to the mount, and running as root lets the
+        // agent write the volume subdir without depending on a deploy-time chown.
+        // Only full `--harden` pins the non-root uid (matching KubeRuntime).
+        assert_eq!(run_as_user(&spec(true)), None);
+        let mut hardened = spec(true);
+        hardened.harden = true;
+        assert_eq!(run_as_user(&hardened).as_deref(), Some("65534:65534"));
+    }
+
+    #[test]
+    fn not_writable_and_not_hardened_stays_unhardened() {
+        // Only `--writable` agents change; an ordinary deploy is untouched.
+        let (bindings, _) = build_port_config(&[8080], "127.0.0.1");
+        let hc = build_host_config(&spec(false), bindings, "nasiko-agent-memory");
+        assert_eq!(hc.readonly_rootfs, None);
+        assert_eq!(hc.cap_drop, None);
+        assert_eq!(hc.security_opt, None);
+        assert_eq!(hc.tmpfs, None);
     }
 
     #[test]
@@ -1670,6 +2267,34 @@ mod writable_tests {
 mod tests {
     use super::*;
 
+    /// The qualification decision, which is the whole of what `pull_image`
+    /// does before it talks to the daemon.
+    #[test]
+    fn a_ref_that_already_names_a_registry_is_not_qualified_again() {
+        // The one that broke: a local dev registry, qualified, with the
+        // built-in OCI registry also configured.
+        assert!(has_registry_host(
+            "localhost:5050/weave-dashboard-generator:v1"
+        ));
+        assert!(has_registry_host("localhost:8443/nasiko/echo-agent:v1"));
+        assert!(has_registry_host("registry.example.com/team/app:1.0"));
+        assert!(has_registry_host("registry.example.com:5000/app:1.0"));
+        // Bare `localhost` with no port is still a registry.
+        assert!(has_registry_host("localhost/app:v1"));
+    }
+
+    #[test]
+    fn a_hub_namespace_is_not_a_registry_and_still_gets_qualified() {
+        // `nasiko` is an organisation on Docker Hub, not a host — qualifying
+        // this is the entire reason registry_host exists, so the fix must not
+        // stop doing it.
+        assert!(!has_registry_host("nasiko/echo-agent:v1"));
+        assert!(!has_registry_host("nasiko/translator:1.0.0"));
+        // No slash at all: a bare image name, likewise unqualified.
+        assert!(!has_registry_host("echo-agent:v1"));
+        assert!(!has_registry_host("ubuntu"));
+    }
+
     #[test]
     fn parse_docker_started_at_accepts_valid_rfc3339() {
         let parsed = parse_docker_started_at(Some("2026-07-21T10:00:05.123456789Z"))
@@ -1714,5 +2339,64 @@ mod tests {
             split_repo_tag("localhost:5000/nutrition:2.0"),
             ("localhost:5000/nutrition", "2.0")
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    const DIR: &str = "/data/00000000-0000-0000-0000-000000000042/agent-1";
+
+    #[test]
+    fn listing_paths_are_relative_to_the_agent_directory() {
+        // What `find … -exec stat -c '%Y %s %n' {} +` actually prints: mtime,
+        // size, then absolute paths under the reader's mount, which the caller
+        // never sees.
+        let stdout =
+            format!("1700000000 12 {DIR}/add_numbers.py\n1700000100 4096 {DIR}/sub/dir/notes.md\n");
+        let entries = parse_workspace_listing(&stdout, DIR);
+        assert_eq!(
+            entries,
+            vec![
+                WorkspaceEntry {
+                    path: "add_numbers.py".to_owned(),
+                    size: 12,
+                    mtime: 1700000000,
+                },
+                WorkspaceEntry {
+                    path: "sub/dir/notes.md".to_owned(),
+                    size: 4096,
+                    mtime: 1700000100,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn listing_skips_unparseable_lines_instead_of_failing() {
+        // One odd filename (or a stray warning on stdout) must not hide every
+        // other file from the user.
+        let stdout =
+            format!("not-a-time 1 {DIR}/x\n7 8 /elsewhere/y\ngarbage\n1700000000 9 {DIR}/ok.txt\n");
+        let entries = parse_workspace_listing(&stdout, DIR);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "ok.txt");
+    }
+
+    #[test]
+    fn listing_is_capped() {
+        let stdout = (0..WORKSPACE_LIST_LIMIT + 10)
+            .map(|i| format!("1700000000 1 {DIR}/f{i}\n"))
+            .collect::<String>();
+        assert_eq!(
+            parse_workspace_listing(&stdout, DIR).len(),
+            WORKSPACE_LIST_LIMIT
+        );
+    }
+
+    #[test]
+    fn empty_listing_for_an_agent_that_never_wrote_anything() {
+        assert!(parse_workspace_listing("", DIR).is_empty());
     }
 }

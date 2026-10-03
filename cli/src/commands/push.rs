@@ -161,12 +161,7 @@ fn reject_if_already_pushed(
     let Some((id, _)) = existing else {
         return Ok(());
     };
-    let history = client.version_history(id)?;
-    let Some(status) = history
-        .into_iter()
-        .find(|v| v.version == version)
-        .map(|v| v.status)
-    else {
+    let Some(status) = client.version_status(id, version)? else {
         return Ok(());
     };
     if status == "pushed" {

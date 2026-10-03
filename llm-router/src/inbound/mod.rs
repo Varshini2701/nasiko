@@ -13,6 +13,7 @@ use crate::ir::{ChatChunk, ChatRequest, ChatResponse, EmbeddingsRequest, Embeddi
 pub mod anthropic;
 pub mod gemini;
 pub mod openai;
+pub mod responses;
 
 pub use anthropic::AnthropicInbound;
 pub use gemini::GeminiInbound;

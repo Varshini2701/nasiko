@@ -4,11 +4,29 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+tokio.workspace = true
+# `json` for the `question`/`human_response`/`resume_state` JSONB columns.
+sqlx = { workspace = true, features = ["json"] }
 chrono = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+# Resume dispatcher (M6): outbound A2A push to the paused agent, and
+# live-endpoint resolution — both leaf crates, no dependency back on
+# oss/server/oss/orchestrator/oss/react-agent.
+reqwest = { workspace = true }
+nasiko-runtime.workspace = true
+nasiko-types.workspace = true
 
 [dev-dependencies]
 regex = { workspace = true }
+tokio = { workspace = true }
+# `simulated` gives the dispatcher tests a real (non-Docker) ContainerRuntime.
+# Deliberately not requesting `docker` here — this crate's tests never need
+# it, and `oss/server`'s own dependency already requests it workspace-wide,
+# so `cargo clippy --workspace` unifies the feature regardless.
+nasiko-runtime = { workspace = true, features = ["simulated"] }
+mockito = { workspace = true }

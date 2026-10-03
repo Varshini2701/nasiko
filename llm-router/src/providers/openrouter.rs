@@ -196,12 +196,10 @@ impl ProviderClient for OpenRouterProvider {
             .get("code")
             .and_then(|c| c.as_str())
             .unwrap_or_default();
-        let param = error.get("param").and_then(|p| p.as_str())?;
-        let droppable = matches!(code, "unsupported_value" | "unsupported_parameter")
-            || (code == "invalid_value" && matches!(param, "max_tokens" | "max_completion_tokens"));
-        if !droppable {
+        if !matches!(code, "unsupported_value" | "unsupported_parameter") {
             return None;
         }
+        let param = error.get("param").and_then(|p| p.as_str())?;
         Some(param.to_string())
     }
 }
@@ -213,6 +211,7 @@ mod tests {
 
     fn resolved(model: &str, temperature: Option<f64>) -> ResolvedConfig {
         ResolvedConfig {
+            compress_enabled: false,
             provider: "openrouter".into(),
             model: model.into(),
             litellm_model: format!("openrouter/{model}"),
@@ -226,6 +225,8 @@ mod tests {
             tier2_model: None,
             tier3_model: None,
             platform_paid: true,
+            custom_endpoint: None,
+            is_coding_agent: false,
         }
     }
 
@@ -379,37 +380,5 @@ mod tests {
             provider.droppable_param(&ProviderError::Transport("x".into())),
             None
         );
-    }
-
-    #[test]
-    fn droppable_param_accepts_invalid_value_only_for_max_tokens() {
-        let provider = provider("http://x".into());
-        let too_large = ProviderError::Status {
-            status: 400,
-            message: json!({
-                "error": {
-                    "message": "max_tokens is too large: 32000",
-                    "type": "invalid_request_error",
-                    "param": "max_tokens",
-                    "code": "invalid_value"
-                }
-            })
-            .to_string(),
-            retryable: false,
-        };
-        assert_eq!(
-            provider.droppable_param(&too_large).as_deref(),
-            Some("max_tokens")
-        );
-
-        let invalid_temperature = ProviderError::Status {
-            status: 400,
-            message: json!({
-                "error": {"code": "invalid_value", "param": "temperature"}
-            })
-            .to_string(),
-            retryable: false,
-        };
-        assert_eq!(provider.droppable_param(&invalid_temperature), None);
     }
 }

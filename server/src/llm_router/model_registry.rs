@@ -1,9 +1,11 @@
 //! Admin API for the tier→model registry (`model_registry` table).
 //!
-//! The table is seeded at migration time (migration 021) with sensible defaults, which the
-//! smart router's `PgTierRegistry` reads (falling back to compiled-in static seeds on a
-//! missing row/DB error). These routes let an operator override those defaults: point a
-//! `(provider, tier)` pair at whatever concrete model they want.
+//! The smart router's `PgTierRegistry` resolves `(provider, tier)` → model in two
+//! steps: rows in this table first (explicit operator overrides, always honored), then
+//! a mapping derived from the provider's live model catalog (`provider_models`, synced
+//! from the provider's `GET /models`) ranked by price. There is no hardcoded model
+//! list — with neither an override nor a catalog, the router passes the request's own
+//! model through rather than guess names the upstream might not serve.
 //!
 //! - `GET  /api/model-registry` — list all configured mappings (any authenticated user).
 //! - `PUT  /api/model-registry` — upsert one `(provider, tier)` → model mapping (superuser).

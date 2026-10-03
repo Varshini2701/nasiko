@@ -12,7 +12,7 @@
 //! Two impls behind the [`CellStore`] seam, mirroring the [tier registry](super::registry):
 //! - [`InMemoryCellStore`] — process-local; the single-node default and the test double.
 //! - [`PgCellStore`] — durable, cross-instance; the `router_quality_cells` table (migration
-//!   026). Like the decision cache, it is **not** load-bearing: a DB error on `load` degrades
+//!   `0005_llm_routing.sql`). Like the decision cache, it is **not** load-bearing: a DB error on `load` degrades
 //!   to an empty map (cold start) and a failed `observe` is dropped, so learning can stall but
 //!   routing never breaks.
 
@@ -76,7 +76,8 @@ impl CellStore for InMemoryCellStore {
     }
 }
 
-/// Postgres-backed cell store reading/writing `router_quality_cells` (migration 026).
+/// Postgres-backed cell store reading/writing `router_quality_cells`
+/// (`oss/migrations/0005_llm_routing.sql`).
 ///
 /// `observe` performs the running-mean update **atomically in SQL** (`INSERT … ON CONFLICT
 /// DO UPDATE`), so concurrent gateway instances can learn without a read-modify-write race.

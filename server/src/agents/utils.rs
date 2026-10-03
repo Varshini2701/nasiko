@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use uuid::Uuid;
 
+use crate::agent_lifecycle::SwappableAgentDeletionHook;
 use crate::build::BuildStatus;
 
 /// Fetch the agent's card from its runtime endpoint and persist the fields
@@ -93,7 +96,56 @@ pub(crate) async fn fetch_and_apply_agent_card(
         crate::catalog::skills::sync_agent_skills_json(db, agent_id, skills_json).await;
     }
 
+    embed_updated_agent(db, agent_id).await;
+
     true
+}
+
+/// Re-reads the agent's current name/description/tags and embeds+persists
+/// them via `nasiko_orchestrator::embed_and_store_agent`, so routing's Stage 1
+/// doesn't have to do it lazily on the next `route()` call. Best-effort —
+/// failures are logged and never block the deploy/update flow.
+///
+/// Reads `OPENAI_API_KEY`/`OPENAI_BASE_URL`/`EMBEDDING_MODEL` straight from
+/// the environment rather than threading `Config` through every deploy path
+/// (seed / upload / update / rollback) that reaches this function — same
+/// env-driven approach `nasiko_config::Config` itself uses for these fields.
+async fn embed_updated_agent(db: &sqlx::PgPool, agent_id: Uuid) {
+    let Ok(api_key) = std::env::var("OPENAI_API_KEY") else {
+        return;
+    };
+    let base_url =
+        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
+    let model =
+        std::env::var("EMBEDDING_MODEL").unwrap_or_else(|_| "text-embedding-3-small".into());
+
+    let row: Option<(String, Option<String>, Vec<String>)> =
+        sqlx::query_as("SELECT name, description, tags FROM agents WHERE id = $1")
+            .bind(agent_id)
+            .fetch_optional(db)
+            .await
+            .unwrap_or(None);
+
+    let Some((name, description, tags)) = row else {
+        return;
+    };
+
+    let agent = nasiko_orchestrator::AgentCard {
+        id: agent_id,
+        name,
+        description: description.unwrap_or_default(),
+        skills: vec![],
+        tags,
+        url: None,
+        embedding: None,
+        embedding_content_hash: None,
+    };
+
+    if let Err(e) =
+        nasiko_orchestrator::embed_and_store_agent(db, &agent, &api_key, &base_url, &model).await
+    {
+        tracing::warn!(%agent_id, error = %e, "proactive agent embedding failed (non-fatal, will be computed lazily on next route())");
+    }
 }
 
 /// Ensure a successful `runtime.deploy()` is visible to the crash-loop
@@ -195,7 +247,17 @@ pub(crate) async fn fetch_agent_card_with_retry(
 /// - `agent_deployments` ON DELETE CASCADE  → deployment rows removed
 /// - `agent_versions`    ON DELETE CASCADE  → version history removed
 /// - `upload_status`     ON DELETE SET NULL → row survives; agent_id becomes NULL
-pub(crate) async fn delete_agent_or_mark_failed(db: &sqlx::PgPool, agent_id: Uuid) {
+///
+/// This is a real `DELETE`, not the soft-delete `oss/server/src/catalog/routes.rs::delete()`
+/// uses — so it never goes through that handler's own `agent_deletion_hook` call. It must fire
+/// the hook itself here, or enterprise-only, agent-keyed state with no FK to `agents` (e.g. an
+/// L1A domain set on this brand-new agent before its first build ever finished) would be left
+/// permanently orphaned with nothing left to clean it up.
+pub(crate) async fn delete_agent_or_mark_failed(
+    db: &sqlx::PgPool,
+    agent_id: Uuid,
+    deletion_hook: &Arc<SwappableAgentDeletionHook>,
+) {
     let has_prior_success: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM agent_builds WHERE agent_id = $1 AND status = 'success')",
     )
@@ -211,11 +273,20 @@ pub(crate) async fn delete_agent_or_mark_failed(db: &sqlx::PgPool, agent_id: Uui
                 .execute(db)
                 .await;
     } else {
-        let _ = sqlx::query("DELETE FROM agents WHERE id = $1")
+        let deleted = sqlx::query("DELETE FROM agents WHERE id = $1")
             .bind(agent_id)
             .execute(db)
-            .await;
-        tracing::info!(%agent_id, "deleted new-agent row after build failure (no prior successful builds)");
+            .await
+            .map(|r| r.rows_affected() > 0)
+            .unwrap_or(false);
+        // Only fire the hook if the row was actually removed — a transient DB error on the
+        // DELETE above must not free enterprise-only, agent-keyed state (e.g. an L1A domain
+        // name) for an agent that still exists. Mirrors `catalog/routes.rs::delete()`'s
+        // `RETURNING` + existence check for the same reason.
+        if deleted {
+            deletion_hook.on_agent_deleted(agent_id).await;
+            tracing::info!(%agent_id, "deleted new-agent row after build failure (no prior successful builds)");
+        }
     }
 }
 

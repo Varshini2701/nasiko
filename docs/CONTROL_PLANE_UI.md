@@ -188,7 +188,7 @@ is the only place the param is spelled.
 Rules when adding or merging a view:
 
 - The `data-view` keys **must** match the `section` keys in that module's `MODULE_NAVS` entry
-  (`navigation.js`, and `ee/ui/web/navigation.js` for pages EE also serves). That pairing is the
+  (`navigation.js`, and the EE navigation module for pages EE also serves). That pairing is the
   whole nav contract; a mismatch shows a highlighted row with no content.
 - View components must **not** render an `app-module-nav` of their own — the shell owns it, and a
   nav inside a view would be destroyed on every switch, which is the thing this pattern exists to

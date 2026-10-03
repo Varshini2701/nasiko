@@ -1,0 +1,10 @@
+[package]
+name = "nasiko-compress"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+# Structural JSON compression needs a real parser — the Json detector requires a
+# full parse, not a prefix guess (a truncated payload must not classify as Json).
+serde_json = { workspace = true }
+thiserror = { workspace = true }

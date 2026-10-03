@@ -215,6 +215,7 @@ fn minimal_spec() -> DeploymentSpec {
         writable: false,
         writable_path: None,
         owner_id: uuid::Uuid::nil(),
+        force_pull: false,
     }
 }
 
@@ -257,6 +258,7 @@ fn deployment_spec_with_all_fields() {
         writable: true,
         writable_path: None,
         owner_id: uuid::Uuid::nil(),
+        force_pull: false,
     };
 
     assert_eq!(spec.min_replicas, 2);
@@ -485,4 +487,36 @@ fn writable_mount_path_defaults_to_workspace() {
     assert_eq!(spec.writable_mount_path(), "/workspace");
     spec.writable_path = Some("/app/data".to_owned());
     assert_eq!(spec.writable_mount_path(), "/app/data");
+}
+
+#[test]
+fn workspace_relative_path_validation_rules() {
+    use nasiko_runtime::validate_workspace_relative_path as v;
+    // Accepted: anything that stays inside the agent's own directory.
+    assert!(v("add_numbers.py").is_ok());
+    assert!(v("sub/dir/file.py").is_ok());
+    assert!(v("a b/c-d_e.tar.gz").is_ok());
+    // Rejected: every shape that could escape it, plus the degenerate ones.
+    assert!(v("").is_err(), "empty");
+    assert!(v("/etc/passwd").is_err(), "absolute");
+    assert!(v("../x").is_err(), "traversal");
+    assert!(v("a/../../etc/passwd").is_err(), "nested traversal");
+    assert!(v("./x").is_err(), "single-dot segment");
+    assert!(v("a//b").is_err(), "empty segment");
+    assert!(v("a:b").is_err(), "colon");
+    assert!(v("a\\b").is_err(), "backslash");
+    assert!(v("a\nb").is_err(), "control char");
+    assert!(v(&"x".repeat(300)).is_err(), "over-long");
+}
+
+#[test]
+fn workspace_ref_subpath_matches_the_volume_layout() {
+    use nasiko_runtime::{ContainerId, WorkspaceRef};
+    let r = WorkspaceRef {
+        owner_id: uuid::Uuid::from_u128(0x42),
+        container_id: ContainerId::new("agent-1"),
+    };
+    // Must stay byte-identical to what the backends mount, or a read would
+    // look in a directory nothing writes to.
+    assert_eq!(r.subpath(), format!("{}/agent-1", r.owner_id));
 }

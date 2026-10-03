@@ -1,4 +1,5 @@
 use super::*;
+use crate::util::dir_references_mcp_gateway;
 
 // ─── resolve_image_deploy_version ────────────────────────────────────────────
 
@@ -234,4 +235,40 @@ fn already_pushed_is_false_for_an_active_version() {
         serde_json::json!({"id": "agent-1", "version": "1.0.0"}),
     );
     assert!(!already_pushed(&client, Some(&existing), "1.0.0").unwrap());
+}
+
+// ─── dir_references_mcp_gateway ──────────────────────────────────────────────
+
+#[test]
+fn dir_references_mcp_gateway_finds_a_reference_in_a_nested_source_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/main.py"),
+        "gateway_url = os.environ['MCP_GATEWAY_URL']\n",
+    )
+    .unwrap();
+    assert!(dir_references_mcp_gateway(dir.path()));
+}
+
+#[test]
+fn dir_references_mcp_gateway_is_false_with_no_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.py"), "print('hello')\n").unwrap();
+    assert!(!dir_references_mcp_gateway(dir.path()));
+}
+
+#[test]
+fn dir_references_mcp_gateway_ignores_skipped_directories() {
+    // A reference sitting only inside a vendored/build dir shouldn't count — a
+    // real MCP_GATEWAY_TOKEN in the repo's own .env, say, isn't the agent's own
+    // code calling the gateway.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+    std::fs::write(
+        dir.path().join("node_modules/pkg/index.js"),
+        "const x = 'MCP_GATEWAY_TOKEN';\n",
+    )
+    .unwrap();
+    assert!(!dir_references_mcp_gateway(dir.path()));
 }

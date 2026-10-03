@@ -535,6 +535,7 @@ mod tests {
             prompt_tokens: Some(4),
             completion_tokens: Some(2),
             total_tokens: Some(6),
+            ..Default::default()
         });
         let _ = r.render(finish_chunk);
 

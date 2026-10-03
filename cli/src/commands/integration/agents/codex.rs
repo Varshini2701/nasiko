@@ -278,6 +278,7 @@ fn snapshot_in(raw: &str, spool_dir: &Path) -> Result<SessionSnapshot> {
 
     Ok(snapshot.unwrap_or_else(|| SessionSnapshot {
         session_id: payload.session_id,
+        title: None,
         turns: Vec::new(),
     }))
 }
@@ -436,6 +437,7 @@ fn apply_event(
         .collect();
     Some(SessionSnapshot {
         session_id: payload.session_id.clone(),
+        title: None,
         turns: vec![Turn {
             uuid: payload.turn_id.clone(),
             prompt,
@@ -450,6 +452,7 @@ fn apply_event(
                 output_tokens: usage.output,
                 cache_read_tokens: usage.cache_read,
                 cache_creation_tokens: 0,
+                accounting: None,
                 started_at,
                 ended_at,
             }],

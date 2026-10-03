@@ -1,9 +1,14 @@
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
+};
+use chrono::{Duration, Utc};
+use nasiko_llm_router::{
+    GatewayConfig,
+    auth::{mint_agent_token, parse_algorithm},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,6 +21,7 @@ use crate::state::AppState;
 
 /// The inbound SDK formats the LLM router can parse — used to validate `inbound_format`.
 const SUPPORTED_INBOUND_FORMATS: [&str; 3] = ["openai", "anthropic", "gemini"];
+const LOCAL_ROUTING_TOKEN_TTL_SECONDS: u64 = 10 * 60;
 
 /// The `llm_configs` columns the resolver reads, assembled by Postgres into one JSON object.
 const CONFIG_JSON: &str = "json_build_object(\
@@ -27,16 +33,19 @@ const CONFIG_JSON: &str = "json_build_object(\
      'is_default', is_default)";
 
 pub fn router() -> Router<AppState> {
-    Router::new().route(
-        "/{id}/llm-config",
-        get(get_llm_config)
-            .patch(update_llm_config)
-            .delete(delete_llm_config),
-    )
+    Router::new()
+        .route(
+            "/{id}/llm-config",
+            get(get_llm_config)
+                .patch(update_llm_config)
+                .delete(delete_llm_config),
+        )
+        .route("/{id}/llm-token", post(issue_llm_token))
 }
 
 /// Resolve the agent's owner, enforcing owner-only (superuser override) access for
 /// llm-config read/write. `Err` is a ready-to-return response (404 unknown / 403 not owner).
+#[allow(clippy::result_large_err)]
 async fn agent_owner_or_reject(
     db: &sqlx::PgPool,
     agent_id: Uuid,
@@ -57,6 +66,89 @@ async fn agent_owner_or_reject(
         }
         Some(o) => Ok(o),
     }
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct LlmTokenResponse {
+    token: String,
+    expires_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct LlmTokenEnvelope {
+    data: LlmTokenResponse,
+    status_code: u16,
+    message: String,
+}
+
+/// Issue a short-lived agent identity token for a local SDK process. The caller
+/// must own the agent; the signing secret never leaves the control plane.
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/llm-token",
+    tag = "agents",
+    params(("id" = Uuid, Path, description = "Agent id")),
+    responses(
+        (status = 200, description = "Short-lived LLM routing token", body = LlmTokenEnvelope),
+        (status = 403, description = "Caller is not the agent owner"),
+        (status = 404, description = "No such agent"),
+        (status = 503, description = "LLM router authentication is not configured"),
+    ),
+)]
+pub(crate) async fn issue_llm_token(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(agent_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let user_id = match claims.user_uuid() {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let owner = match agent_owner_or_reject(&state.db, agent_id, user_id, claims.is_superuser).await
+    {
+        Ok(owner) => owner,
+        Err(resp) => return resp,
+    };
+    if owner != user_id {
+        return (StatusCode::FORBIDDEN, "not the agent owner").into_response();
+    }
+
+    let cfg = GatewayConfig::from_env();
+    if cfg.agent_jwt_secret.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AGENT_JWT_SECRET is not configured",
+        )
+            .into_response();
+    }
+    let token = match mint_agent_token(
+        &agent_id.to_string(),
+        &owner.to_string(),
+        &cfg.agent_jwt_secret,
+        LOCAL_ROUTING_TOKEN_TTL_SECONDS,
+        parse_algorithm(&cfg.agent_jwt_algorithm),
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::error!(%error, %agent_id, "failed to mint local LLM routing token");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to issue LLM routing token",
+            )
+                .into_response();
+        }
+    };
+    let expires_at = Utc::now() + Duration::seconds(LOCAL_ROUTING_TOKEN_TTL_SECONDS as i64);
+    let mut response = ApiResponse::ok(
+        json!(LlmTokenResponse { token, expires_at }),
+        "LLM routing token issued successfully",
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
 }
 
 /// Resolve the config an agent routes through: attached (`agents.llm_config_id`) → the owner's

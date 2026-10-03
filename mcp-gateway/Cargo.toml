@@ -7,6 +7,10 @@ version.workspace = true
 name = "nasiko_mcp_gateway"
 path = "src/lib.rs"
 
+[[bin]]
+name = "tool-search-bench"
+path = "src/bin/tool_search_bench.rs"
+
 [dependencies]
 # Async runtime & data
 tokio.workspace = true
@@ -42,6 +46,15 @@ nasiko-observability.workspace = true
 # LLM description fallback (description_backfill.rs) — reuses the same
 # LLMProvider/ChatCompletionRequest the capability generator already uses.
 nasiko-orchestrator.workspace = true
+# HITL persistence: create_pending_auth_required (protocol.rs's AuthRequired path).
+nasiko-hitl.workspace = true
+# FlowContext::from_traceparent — reused (not reimplemented) to parse the
+# trace_id out of a forwarded `traceparent` header for HITL context resolution.
+nasiko-flow.workspace = true
+
+# ─── Bench binary only ──────────────────────────────────────────────────────
+clap = { workspace = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
 # HTTP mocking for provider (generic MCP + Composio) tests.

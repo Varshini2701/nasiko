@@ -73,7 +73,9 @@ clippy:
 # Phase I — unit tests, no infra required
 test-unit:
     cargo test \
+      -p nasiko \
       -p nasiko-auth \
+      -p nasiko-compress \
       -p nasiko-secrets \
       -p nasiko-config \
       -p nasiko-utils \
@@ -83,7 +85,25 @@ test-unit:
       -p nasiko-orchestrator \
       -p nasiko-runtime \
       -p nasiko-observability \
-      -p nasiko-github
+      -p nasiko-github \
+      -p nasiko-llm-router
+    # `--lib` because these three keep their DB-backed suites in `tests/` (Phase II,
+    # `test-crates` below) — only their hermetic lib tests belong in Phase I, which is why they
+    # can't just join the list above. `nasiko-react-agent` has no `tests/` dir at all, so `--lib`
+    # is everything it has.
+    cargo test --lib -p nasiko-hitl -p nasiko-mcp-gateway -p nasiko-react-agent
+
+# Phase II — library-crate integration tests that need Postgres (run `just infra` first).
+# Serial for the same reason `test-server` is: they share one database, and `nasiko-hitl`'s own
+# `tests/store.rs` truncates `hitl_requests` on entry. Kept a separate recipe from `test-server`
+# so a failure names the layer it came from. Re-runs the lib tests `test-unit` already covered
+# (~200 tests, well under a second) rather than glob-selecting every `--test` target by hand.
+# `--include-ignored`: every test in `nasiko-hitl`'s own `tests/store.rs` is marked
+# `#[ignore = "requires PostgreSQL"]` so a plain `cargo test` (no infra) doesn't fail — but that
+# mark is static, not conditional on `DATABASE_URL`, so without this flag Postgres being up here
+# never actually un-skips them (found in review: they were silently 0-run for every prior PR).
+test-crates:
+    cargo test -p nasiko-hitl -p nasiko-mcp-gateway -- --test-threads=1 --include-ignored
 
 # Phase II — server integration tests (run `just infra` first)
 test-server:
@@ -93,5 +113,5 @@ test-server:
 test-one name:
     cargo test -p nasiko-server --test {{name}} -- --test-threads=1
 
-# All OSS tests: unit + server integration
-test: test-unit test-server
+# All OSS tests: unit + library-crate and server integration
+test: test-unit test-crates test-server

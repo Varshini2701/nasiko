@@ -15,6 +15,7 @@ fn main() {
         name: "Echo".to_string(),
         description: "Echoes the input back to the caller.".to_string(),
         tags: vec!["demo".to_string(), "text".to_string()],
+        examples: Vec::new(),
     };
 
     // Default orchestrator configuration.

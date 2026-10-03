@@ -291,6 +291,7 @@ mod tests {
                 session: CodingAgentSession {
                     id: coding_agent_session_id("claude", session),
                     source_id: session.into(),
+                    title: None,
                 },
                 turn: CodingAgentTurn {
                     id: turn.into(),

@@ -1,6 +1,6 @@
 //! Per-agent credentials for pulling that agent's image out of this
 //! registry from a real Kubernetes node — see
-//! `oss/migrations/018_oci_pull_credentials.sql`.
+//! `oss/migrations/0002_oci.sql`.
 //!
 //! The registry's normal auth is bearer-JWT (the host's session token),
 //! which doesn't fit the `kubernetes.io/dockerconfigjson` shape kubelet/

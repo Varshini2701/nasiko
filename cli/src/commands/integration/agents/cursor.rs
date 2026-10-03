@@ -157,7 +157,11 @@ pub fn snapshot(raw: &str) -> Result<SessionSnapshot> {
     })?;
     let session_id = payload.conversation_id.clone();
     let turns = assemble_spooled(payload)?;
-    Ok(SessionSnapshot { session_id, turns })
+    Ok(SessionSnapshot {
+        session_id,
+        title: None,
+        turns,
+    })
 }
 
 fn hooks_path(config: &Path) -> PathBuf {
@@ -377,6 +381,7 @@ fn complete_turn(pending: &mut PendingTurn, payload: &HookPayload) -> Option<Tur
             output_tokens: pending.output_tokens.unwrap_or(0),
             cache_read_tokens: pending.cache_read_tokens.unwrap_or(0),
             cache_creation_tokens: pending.cache_write_tokens.unwrap_or(0),
+            accounting: None,
             started_at,
             ended_at,
         }],

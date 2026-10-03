@@ -84,6 +84,7 @@ mod tests {
                 prompt_tokens: Some(3),
                 completion_tokens: None,
                 total_tokens: Some(3),
+                ..Default::default()
             }),
             extra: Map::new(),
         };

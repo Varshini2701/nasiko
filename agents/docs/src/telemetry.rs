@@ -139,6 +139,16 @@ pub fn genai_output_message(
     }])
 }
 
+/// Inject the given OTel context as a W3C `traceparent` header value for an outbound
+/// HTTP call, so the LLM gateway can attribute the call to the originating user flow.
+/// Returns None when the context carries no valid span context.
+pub fn traceparent_for_context(cx: &opentelemetry::Context) -> Option<String> {
+    use opentelemetry::propagation::TextMapPropagator;
+    let mut carrier = std::collections::HashMap::new();
+    opentelemetry_sdk::propagation::TraceContextPropagator::new().inject_context(cx, &mut carrier);
+    carrier.get("traceparent").cloned()
+}
+
 /// Parse a W3C `traceparent` header (`00-<trace_id>-<span_id>-<flags>`) into a
 /// remote OTel context, so spans created under it join the caller's trace.
 /// Returns None for anything malformed — the caller then starts a local root

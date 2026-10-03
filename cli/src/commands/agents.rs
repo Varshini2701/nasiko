@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::Command;
 
+use nasiko_utils::display::opt_dash;
 use serde::Deserialize;
 use tabled::settings::{Alignment, Style};
 use tabled::{Table, Tabled};
@@ -377,14 +378,42 @@ pub fn cmd_ls() -> Result<()> {
         return Ok(());
     }
 
+    // Same label the web UI shows (e.g. "Claude Code (ankit@nasiko.com)") —
+    // `AgentRecord.name` stays the real identifier used for chat targeting
+    // and resolution elsewhere, so it isn't touched, just not what's printed.
+    let rows: Vec<LsTableRow> = agents
+        .iter()
+        .map(|a| LsTableRow {
+            id: a.id.clone(),
+            name: a.display_name.clone().unwrap_or_else(|| a.name.clone()),
+            status: a.status.clone(),
+            version: a.version.clone(),
+            url: a.url.clone(),
+        })
+        .collect();
+
     println!(
         "{}",
-        Table::new(&agents)
+        Table::new(&rows)
             .with(Style::blank())
             .with(Alignment::left())
     );
     println!("\n{} agent(s) total.", agents.len());
     Ok(())
+}
+
+#[derive(Tabled)]
+struct LsTableRow {
+    #[tabled(rename = "ID")]
+    id: String,
+    #[tabled(rename = "NAME")]
+    name: String,
+    #[tabled(rename = "STATUS", display = "opt_dash")]
+    status: Option<String>,
+    #[tabled(rename = "VERSION", display = "opt_dash")]
+    version: Option<String>,
+    #[tabled(rename = "URL", display = "opt_dash")]
+    url: Option<String>,
 }
 
 pub fn cmd_get(agent_id: Option<&str>, name: Option<&str>, format: &str) -> Result<()> {

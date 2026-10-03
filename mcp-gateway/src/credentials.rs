@@ -19,19 +19,27 @@ use crate::provider::GenericMcpProvider;
 use crate::provider::generic::LIST_TIMEOUT;
 use crate::repo::{self, McpConnector, McpUserConnection};
 use crate::state::McpState;
-use crate::types::{MCPServerConfig, ServerType};
+use crate::types::{ConnectorUnusable, MCPServerConfig, ServerType, UnusableConnector};
+
+/// Result of resolving a user's generic (non-Composio) backends: the live
+/// configs to fan out to, plus why every other accessible connector was
+/// skipped this cycle — the latter is what lets `tools/call`'s routing
+/// failure path (`router::unusable_reason_for_prefix`) distinguish
+/// "needs re-authentication" from a genuinely unknown tool name.
+#[derive(Debug, Clone, Default)]
+pub struct GenericServers {
+    pub configs: Vec<MCPServerConfig>,
+    pub unusable: HashMap<Uuid, UnusableConnector>,
+}
 
 /// Build the ordered list of generic backends for `user_id`, credentials injected.
-pub async fn build_generic_servers(
-    state: &McpState,
-    user_id: Uuid,
-) -> Result<Vec<MCPServerConfig>> {
+pub async fn build_generic_servers(state: &McpState, user_id: Uuid) -> Result<GenericServers> {
     let connectors = state
         .authorizer
         .list_accessible_mcp_connectors(&state.db, user_id)
         .await?;
     if connectors.is_empty() {
-        return Ok(Vec::new());
+        return Ok(GenericServers::default());
     }
 
     let conns = repo::list_user_connections(&state.db, user_id, None).await?;
@@ -39,23 +47,35 @@ pub async fn build_generic_servers(
         conns.into_iter().map(|c| (c.connector_id, c)).collect();
 
     let crypto = SecretsCrypto::for_user(user_id);
-    let mut result = Vec::with_capacity(connectors.len());
+    let mut configs = Vec::with_capacity(connectors.len());
+    let mut unusable = HashMap::new();
 
     for connector in &connectors {
         let conn = conn_by_connector.get(&connector.id);
-        if let Some(cfg) = build_server_config(state, &crypto, user_id, connector, conn).await? {
-            result.push(cfg);
+        match build_server_config(state, &crypto, user_id, connector, conn).await? {
+            Ok(cfg) => configs.push(cfg),
+            Err(reason) => {
+                tracing::debug!(connector = %connector.name, ?reason, "connector unusable — skipping");
+                unusable.insert(
+                    connector.id,
+                    UnusableConnector {
+                        reason,
+                        name: connector.name.clone(),
+                    },
+                );
+            }
         }
     }
 
-    Ok(result)
+    Ok(GenericServers { configs, unusable })
 }
 
 /// Build one connector's `MCPServerConfig`, injecting whatever per-user
-/// credential/OAuth token applies for its `auth_type` — `Ok(None)` means
+/// credential/OAuth token applies for its `auth_type` — `Err(reason)` means
 /// "not currently usable" (no credential yet, decrypt failure, etc.), not an
-/// error. The single source of truth both `build_generic_servers` (the live
-/// list for a user's session) and `verify_connector_live` (proving a
+/// error, but now distinguishes *why* instead of collapsing to a bare
+/// `Option`. The single source of truth both `build_generic_servers` (the
+/// live list for a user's session) and `verify_connector_live` (proving a
 /// just-configured credential actually works) route through, so verification
 /// can never drift from what a real tool call would actually send.
 async fn build_server_config(
@@ -64,9 +84,9 @@ async fn build_server_config(
     user_id: Uuid,
     connector: &McpConnector,
     conn: Option<&McpUserConnection>,
-) -> Result<Option<MCPServerConfig>> {
+) -> Result<std::result::Result<MCPServerConfig, ConnectorUnusable>> {
     let Some(base_url) = connector.url.clone().filter(|u| !u.is_empty()) else {
-        return Ok(None);
+        return Ok(Err(ConnectorUnusable::NotConfigured));
     };
     let auth_type = connector.auth_type.as_deref().unwrap_or("none");
     let mut headers = parse_headers(&connector.headers);
@@ -78,46 +98,48 @@ async fn build_server_config(
         "bearer" | "basic" => match conn.and_then(|c| c.encrypted_credential.as_deref()) {
             Some(enc) => {
                 let Some(value) = decrypt_or_skip(crypto, enc, connector) else {
-                    return Ok(None);
+                    return Ok(Err(ConnectorUnusable::AuthRequired));
                 };
                 headers.insert(credential_header(connector), value);
             }
             // No per-user credential: rely on static headers, else skip.
-            None if headers.is_empty() => return Ok(None),
+            None if headers.is_empty() => return Ok(Err(ConnectorUnusable::MissingCredential)),
             None => {}
         },
 
         "url_param" => {
             let Some(param) = connector.url_param_name.as_deref() else {
                 tracing::warn!(connector = %connector.name, "url_param connector missing url_param_name — skipping");
-                return Ok(None);
+                return Ok(Err(ConnectorUnusable::NotConfigured));
             };
             let Some(enc) = conn.and_then(|c| c.encrypted_credential.as_deref()) else {
-                return Ok(None);
+                return Ok(Err(ConnectorUnusable::MissingCredential));
             };
             let Some(value) = decrypt_or_skip(crypto, enc, connector) else {
-                return Ok(None);
+                return Ok(Err(ConnectorUnusable::AuthRequired));
             };
             url = inject_url_param(&url, param, &value)?;
         }
 
         "oauth2" => {
-            let Some(conn) = conn else { return Ok(None) };
+            let Some(conn) = conn else {
+                return Ok(Err(ConnectorUnusable::MissingCredential));
+            };
             match oauth::access_token_for(state, crypto, user_id, connector, conn).await? {
-                Some(access) => {
+                Ok(access) => {
                     headers.insert("Authorization".to_string(), format!("Bearer {access}"));
                 }
-                None => return Ok(None),
+                Err(reason) => return Ok(Err(reason)),
             }
         }
 
         other => {
             tracing::warn!(connector = %connector.name, auth_type = other, "unknown auth_type — skipping");
-            return Ok(None);
+            return Ok(Err(ConnectorUnusable::NotConfigured));
         }
     }
 
-    Ok(Some(MCPServerConfig {
+    Ok(Ok(MCPServerConfig {
         connector_id: connector.id,
         kind: ServerType::Mcp,
         name: connector.name.clone(),
@@ -161,8 +183,8 @@ pub async fn verify_connector_live(
     };
 
     let cfg = match build_server_config(state, &crypto, user_id, connector, conn.as_ref()).await {
-        Ok(Some(cfg)) => cfg,
-        Ok(None) => {
+        Ok(Ok(cfg)) => cfg,
+        Ok(Err(_reason)) => {
             return VerifyOutcome {
                 verified: false,
                 error: Some(
@@ -311,6 +333,36 @@ pub async fn register_credential(
     };
     repo::set_connector_setup_status(&state.db, connector.id, status, error).await?;
 
+    if outcome.verified {
+        // Same auto-resolve hook as the generic OAuth2 callback
+        // (`oauth.rs::handle_callback`) and the Composio callback
+        // (`connect.rs::handle_composio_callback`) — re-entering a working
+        // bearer/basic credential is just as much "the credential now
+        // works" as either of those, and this connector type has no OAuth
+        // callback at all to have caught it instead.
+        match nasiko_hitl::repo::resolve_pending_auth_required_for_connector(
+            &state.db,
+            user_id,
+            connector.id,
+        )
+        .await
+        {
+            Ok(resolved) if !resolved.is_empty() => {
+                tracing::info!(
+                    connector = %connector.name, %user_id, resolved_count = resolved.len(),
+                    "auto-resolved pending auth_required hitl requests after credential registration"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e, connector = %connector.name, %user_id,
+                    "failed to auto-resolve pending auth_required hitl requests"
+                );
+            }
+        }
+    }
+
     crate::session::invalidate_session_cache(state, user_id).await;
     tracing::info!(connector = %connector.name, %user_id, verified = outcome.verified, "registered user credential");
     Ok(outcome)
@@ -353,9 +405,13 @@ pub async fn delete_credential(
 mod tests {
     use base64::Engine;
     use chrono::Utc;
+    use nasiko_secrets::SecretsCrypto;
+    use std::sync::Arc;
     use uuid::Uuid;
 
-    use super::{B64, normalize_for};
+    use super::{B64, ConnectorUnusable, McpState, build_server_config, normalize_for};
+    use crate::config::{McpConfig, ToolSearchMode};
+    use crate::provider::{GenericMcpProvider, Providers};
     use crate::repo::McpConnector;
 
     fn connector(auth_type: &str, credential_header_name: Option<&str>) -> McpConnector {
@@ -420,5 +476,153 @@ mod tests {
     fn normalize_url_param_and_none_are_raw() {
         assert_eq!(normalize_for(&connector("url_param", None), "abc"), "abc");
         assert_eq!(normalize_for(&connector("none", None), "abc"), "abc");
+    }
+
+    // ─── build_server_config: distinguishable `ConnectorUnusable` reasons ──────
+
+    /// Install a valid `SECRETS_ENCRYPTION_KEY` so `SecretsCrypto::for_user`
+    /// doesn't panic — mirrors `oss/secrets/tests/crypto.rs`'s `install_valid_key`.
+    fn install_valid_encryption_key() {
+        use base64::engine::general_purpose::STANDARD as B64Std;
+        let key = B64Std.encode([0x24u8; 32]);
+        // SAFETY: all callers in this module install the same value, so a
+        // concurrent set from another test is not observably different.
+        unsafe { std::env::set_var("SECRETS_ENCRYPTION_KEY", &key) };
+    }
+
+    fn test_state() -> McpState {
+        let db = sqlx::PgPool::connect_lazy("postgres://user:pass@127.0.0.1:1/db")
+            .expect("lazy pool construction must not touch the network");
+        let redis = redis::Client::open("redis://127.0.0.1:1/").expect("lazy redis client");
+        McpState {
+            db,
+            redis,
+            http_client: reqwest::Client::new(),
+            guarded_http_client: reqwest::Client::new(),
+            config: McpConfig {
+                composio_api_key: None,
+                composio_base_url: "http://localhost".to_string(),
+                composio_webhook_secret: None,
+                gateway_public_url: None,
+                oauth_redirect_base_url: None,
+                composio_callback_base_url: None,
+                session_ttl_seconds: 60,
+                perm_cache_ttl_seconds: 60,
+                manifest_ttl_seconds: 60,
+                toolcount_ttl_seconds: 3600,
+                oauth_state_signing_key: "test".to_string(),
+                description_model: "gpt-4o-mini".to_string(),
+                hitl_request_ttl_days: 7,
+                tool_search_mode: ToolSearchMode::Semantic,
+                tool_search_tool_limit: 0,
+                tool_search_meta_limit: 0,
+                openai_api_key: None,
+                embedding_model: "".to_string(),
+            },
+            providers: Providers {
+                composio: None,
+                mcp: GenericMcpProvider::new(reqwest::Client::new(), reqwest::Client::new()),
+            },
+            authorizer: std::sync::Arc::new(crate::authorizer::OssConnectorAuthorizer),
+            endpoint_refresher: std::sync::Arc::new(crate::endpoint_refresh::NoopEndpointRefresher),
+            llm: nasiko_orchestrator::providers::LLMProvider::from_env(reqwest::Client::new()),
+            search_index: Arc::new(crate::search::NoopSearchIndex),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_server_config_flags_not_configured_when_url_missing() {
+        install_valid_encryption_key();
+        let state = test_state();
+        let crypto = SecretsCrypto::for_user(Uuid::new_v4());
+        let mut c = connector("bearer", None);
+        c.url = None;
+        let result = build_server_config(&state, &crypto, Uuid::new_v4(), &c, None)
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err(), ConnectorUnusable::NotConfigured);
+    }
+
+    #[tokio::test]
+    async fn build_server_config_flags_not_configured_for_unknown_auth_type() {
+        install_valid_encryption_key();
+        let state = test_state();
+        let crypto = SecretsCrypto::for_user(Uuid::new_v4());
+        let c = connector("carrier-pigeon", None);
+        let result = build_server_config(&state, &crypto, Uuid::new_v4(), &c, None)
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err(), ConnectorUnusable::NotConfigured);
+    }
+
+    #[tokio::test]
+    async fn build_server_config_flags_missing_credential_for_bearer_without_credential() {
+        install_valid_encryption_key();
+        let state = test_state();
+        let crypto = SecretsCrypto::for_user(Uuid::new_v4());
+        let c = connector("bearer", None);
+        let result = build_server_config(&state, &crypto, Uuid::new_v4(), &c, None)
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err(), ConnectorUnusable::MissingCredential);
+    }
+
+    #[tokio::test]
+    async fn build_server_config_flags_missing_credential_for_oauth2_without_connection() {
+        install_valid_encryption_key();
+        let state = test_state();
+        let crypto = SecretsCrypto::for_user(Uuid::new_v4());
+        let c = connector("oauth2", None);
+        let result = build_server_config(&state, &crypto, Uuid::new_v4(), &c, None)
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err(), ConnectorUnusable::MissingCredential);
+    }
+
+    #[tokio::test]
+    async fn build_server_config_flags_auth_required_on_bearer_decrypt_failure() {
+        install_valid_encryption_key();
+        let state = test_state();
+        let crypto = SecretsCrypto::for_user(Uuid::new_v4());
+        let c = connector("bearer", None);
+        let conn = crate::repo::McpUserConnection {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            connector_id: c.id,
+            status: "active".into(),
+            connected_account_id: None,
+            redirect_url: None,
+            oauth_url: None,
+            // Not valid ciphertext for this crypto instance — decrypt must fail.
+            encrypted_credential: Some("not-real-ciphertext".into()),
+            encrypted_refresh_token: None,
+            token_expires_at: None,
+            scope: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let result = build_server_config(&state, &crypto, Uuid::new_v4(), &c, Some(&conn))
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err(), ConnectorUnusable::AuthRequired);
+    }
+
+    #[test]
+    fn connector_unusable_reasons_are_all_distinguishable() {
+        // The DoD for M1: missing-credential, disabled/never-configured, and
+        // auth-required (decrypt/refresh failure) must be three distinct values,
+        // not collapsed back into a single "unusable" bucket.
+        assert_ne!(
+            ConnectorUnusable::NotConfigured,
+            ConnectorUnusable::MissingCredential
+        );
+        assert_ne!(
+            ConnectorUnusable::MissingCredential,
+            ConnectorUnusable::AuthRequired
+        );
+        assert_ne!(
+            ConnectorUnusable::NotConfigured,
+            ConnectorUnusable::AuthRequired
+        );
     }
 }

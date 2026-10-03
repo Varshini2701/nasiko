@@ -45,7 +45,47 @@ pub struct StepResult {
     /// The actual prompt sent to the agent after placeholder substitution.
     pub prompt: String,
     pub extracted_info: Option<String>,
+    /// MAF's own orchestration tokens for this step (placeholder fill +
+    /// extraction), taken from the platform's `token_usage` rows rather than
+    /// counted locally, so it agrees with what the platform bills.
+    ///
+    /// These do NOT sum to the execution's `tokens_used`: planning and final
+    /// synthesis are run-level phases that belong to no step.
     pub tokens_used: i64,
+    /// W3C trace id this step's agent call was made under, derived
+    /// deterministically from (execution_id, step_index) by
+    /// `build_traceparent`. This is the key the usage API joins on to pull the
+    /// step's agent-side token/cost figures out of `trace_usage`.
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    /// Agent-call input tokens for this step — excludes MAF's own
+    /// planning/reasoning LLM calls, so this is directly comparable to an
+    /// agent-view FinOps row's `prompt_tokens`.
+    ///
+    /// NOTE: this and the four fields below are **not** populated on the
+    /// execution path (collecting them inline cost up to 10s per step). They
+    /// stay zero in the stored row; the live values come from
+    /// `GET /api/maf/execution/{id}/usage`.
+    #[serde(default)]
+    pub input_tokens: i64,
+    /// Agent-call output tokens for this step. Same scope note as `input_tokens`.
+    #[serde(default)]
+    pub output_tokens: i64,
+    /// Prompt tokens served from provider cache (OpenAI cached / Anthropic cache read).
+    #[serde(default)]
+    pub cache_read_tokens: i64,
+    /// Prompt tokens written to provider cache (Anthropic cache creation).
+    #[serde(default)]
+    pub cache_creation_tokens: i64,
+    /// Model used for this step's agent call, when known.
+    #[serde(default)]
+    pub model_used: Option<String>,
+    /// USD cost of this step's MAF orchestration calls, as priced by the
+    /// platform's `calculate_usage_cost_trigger`. Same scope as
+    /// `tokens_used` above — agent-call cost is served separately by
+    /// `GET /api/maf/execution/{id}/usage`.
+    #[serde(default)]
+    pub cost_usd: f64,
     pub latency_ms: i64,
     pub context: Option<String>,
     pub obs_logs: serde_json::Value,
@@ -59,4 +99,26 @@ pub struct ExecutionResult {
     pub output: String,
     pub step_results: Vec<StepResult>,
     pub tokens_used: i64,
+    /// Sum of every step's `cost_usd` — agent-call spend only.
+    pub cost_usd: f64,
+}
+
+/// What a MAF run produced: either it ran to completion, or one step's agent asked for a human
+/// and the run stopped there, awaiting `POST /api/hitl/{id}/resolve`.
+pub enum StepOutcome {
+    Completed(ExecutionResult),
+    AwaitingHuman(PausedStep),
+}
+
+/// One step's pause, carrying everything needed to create the `hitl_requests` row and, later,
+/// resume exactly this step via `executor::run_maf_from`.
+pub struct PausedStep {
+    pub step_index: i32,
+    /// The agent's own `taskId` — the A2A continuation must target this, never a synthetic one.
+    pub task_id: String,
+    /// The MAF execution id (stringified) — doubles as the A2A `contextId` for every step, per
+    /// `executor.rs::call_agent`'s existing convention.
+    pub context_id: String,
+    pub kind: nasiko_hitl::HitlKind,
+    pub question: serde_json::Value,
 }

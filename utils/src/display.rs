@@ -2,7 +2,7 @@
 //!
 //! `Option<T>` has no `Display` impl in Rust, so every optional table column
 //! needs one of these to render `None` as something other than a compile
-//! error. Used by both `nasiko` (oss/cli) and `nasiko-ee` (ee/cli).
+//! error. Used by both `nasiko` (oss/cli) and `nasiko-ee`.
 
 use std::fmt::Display;
 

@@ -24,6 +24,13 @@ pub enum GatewayError {
     #[error("Token missing agent_id claim")]
     MissingAgentId,
 
+    // ── 403 — authenticated but unattributable (strict flow enforcement) ────
+    // The agent's credential is valid — what's missing is authorization
+    // context (a live flow the agent participates in). Deliberately NOT 401:
+    // that would send well-behaved clients into credential-refresh loops.
+    #[error("{0}")]
+    Forbidden(String),
+
     // ── 400 — client-actionable request/resolution errors ───────────────────
     #[error("{0}")]
     BadRequest(String),
@@ -53,6 +60,7 @@ impl GatewayError {
             | GatewayError::TokenExpired
             | GatewayError::InvalidToken(_)
             | GatewayError::MissingAgentId => StatusCode::UNAUTHORIZED,
+            GatewayError::Forbidden(_) => StatusCode::FORBIDDEN,
             GatewayError::BadRequest(_)
             | GatewayError::NoRegistryEntry(_)
             | GatewayError::SecretNotFound(_, _)

@@ -129,7 +129,9 @@ where
     F: FnOnce(AppState) -> Fut,
     Fut: Future<Output = axum::Router>,
 {
-    let state = AppState::from_config_with_db(config, auth, runtime, db).await;
+    let oci_storage: Arc<dyn nasiko_runtime::BlobStore> =
+        Arc::new(nasiko_oci::storage::S3Storage::from_env(config.oci_storage_bucket.clone()).await);
+    let state = AppState::from_config_with_db(config, auth, runtime, oci_storage, db).await;
     let app = build(state).await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -144,7 +146,7 @@ where
         let _ = axum::serve(listener, app).await;
     });
 
-    // Defensive — mirrors `ee/server/tests/common::TestServer::start` — the
+    // Defensive — mirrors the enterprise server's `TestServer::start` — the
     // accept loop needs a tick to actually start polling the listener.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 

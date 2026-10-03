@@ -12,9 +12,10 @@ use nasiko_config::Config;
 use sqlx::PgPool;
 
 use crate::authorizer::{ConnectorAuthorizer, OssConnectorAuthorizer};
-use crate::config::McpConfig;
+use crate::config::{McpConfig, ToolSearchMode};
 use crate::endpoint_refresh::{EndpointRefresher, NoopEndpointRefresher};
 use crate::provider::Providers;
+use crate::search::ToolSearchIndex;
 
 #[derive(Clone)]
 pub struct McpState {
@@ -42,6 +43,8 @@ pub struct McpState {
     /// source didn't provide — see `description_backfill`. Never used when a
     /// native description is already present.
     pub llm: nasiko_orchestrator::providers::LLMProvider,
+    /// Flat tool search index — semantic (default) or BM25 (fallback).
+    pub search_index: Arc<dyn ToolSearchIndex>,
 }
 
 impl McpState {
@@ -55,6 +58,26 @@ impl McpState {
         let mcp_config = McpConfig::from_config(config);
         let providers = Providers::new(http_client.clone(), &mcp_config);
         let llm = nasiko_orchestrator::providers::LLMProvider::from_env(http_client.clone());
+        let search_index: Arc<dyn ToolSearchIndex> = match mcp_config.tool_search_mode {
+            ToolSearchMode::Semantic => {
+                if let Some(ref api_key) = mcp_config.openai_api_key {
+                    Arc::new(crate::search::SemanticSearchIndex::new(
+                        http_client.clone(),
+                        redis.clone(),
+                        api_key.clone(),
+                        mcp_config.embedding_model.clone(),
+                    ))
+                } else {
+                    tracing::warn!(
+                        "MCP_TOOL_SEARCH_MODE=semantic but OPENAI_API_KEY not set, \
+                         falling back to keyword"
+                    );
+                    Arc::new(crate::search::Bm25SearchIndex::new())
+                }
+            }
+            ToolSearchMode::Keyword => Arc::new(crate::search::Bm25SearchIndex::new()),
+            ToolSearchMode::None => Arc::new(crate::search::NoopSearchIndex),
+        };
         Self {
             db,
             redis,
@@ -65,6 +88,7 @@ impl McpState {
             authorizer: Arc::new(OssConnectorAuthorizer),
             endpoint_refresher: Arc::new(NoopEndpointRefresher),
             llm,
+            search_index,
         }
     }
 }

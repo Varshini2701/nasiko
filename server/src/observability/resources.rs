@@ -68,7 +68,7 @@ impl AgentNameResolver for DbAgentNames {
 /// behind it.
 ///
 /// Deliberately *below* the Resources page's poll interval (`POLL_INTERVAL_MS`,
-/// 5s, in `oss/ui/common/components/resources-page.js`) so each poll finds a
+/// 5s, in `ui/common/pages/resources-page.js`) so each poll finds a
 /// reading already refreshed by the previous one. When this equalled the poll
 /// interval every poll landed just after expiry and paid the full per-container
 /// sweep — the cache existed but effectively never hit.

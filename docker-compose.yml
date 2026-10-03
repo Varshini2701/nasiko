@@ -102,6 +102,7 @@ services:
       LOKI_URL: http://loki:3100
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       OTEL_COLLECTOR_ENDPOINT: http://otel-collector:4317
+      CODING_AGENT_OTLP_ENDPOINT: http://otel-collector:4318
       # Agents inside Docker reach the server via this name.
       MCP_GATEWAY_PUBLIC_URL: http://server:8080/api/mcp
       LLM_GATEWAY_BASE_URL: http://server:8080

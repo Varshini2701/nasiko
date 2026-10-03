@@ -143,6 +143,7 @@ pub struct McpConnectorTool {
     pub connector_id: Uuid,
     pub tool_name: String,
     pub description: Option<String>,
+    pub input_schema: Option<Value>,
     pub default_stance: String,
     pub last_synced_at: Option<DateTime<Utc>>,
 }
@@ -557,6 +558,35 @@ pub async fn resolve_user_labels(
         .collect())
 }
 
+/// One `users` row's worth of what [`resolve_user_details`] resolves.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UserDetail {
+    pub id: Uuid,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub role: Option<String>,
+}
+
+/// Like [`resolve_user_labels`], plus `email`/`role` — what `list_access_reasons`
+/// needs to render an agent-detail-page-style USER/EMAIL/ROLE/GRANT table.
+/// Kept separate rather than widening `resolve_user_labels` itself: that
+/// function's other caller (`list_consumers_view`'s user rows and
+/// `granted_by` labels) has no use for either column, and every existing
+/// call site would have to unpack two fields it throws away.
+pub async fn resolve_user_details(db: &PgPool, ids: &[Uuid]) -> Result<HashMap<Uuid, UserDetail>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<UserDetail> = sqlx::query_as(
+        "SELECT id, username, display_name, email, role::text FROM users WHERE id = ANY($1)",
+    )
+    .bind(ids)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|u| (u.id, u)).collect())
+}
+
 /// Search users by username substring, for the "who do I share this with"
 /// picker. Username only (never email) — intentionally open to any
 /// authenticated caller, not just admins, so it must never leak more than a
@@ -947,23 +977,26 @@ pub async fn list_recent_connector_ids(
 
 // ─── Tool catalog ─────────────────────────────────────────────────────────────
 
-/// Replace a connector's synced tool catalog with `tools` (name, description).
+/// Replace a connector's synced tool catalog with `tools` (name, description, input_schema).
 pub async fn upsert_connector_tools(
     db: &PgPool,
     connector_id: Uuid,
-    tools: &[(String, Option<String>)],
+    tools: &[(String, Option<String>, Option<Value>)],
 ) -> Result<()> {
     let mut tx = db.begin().await?;
-    for (name, desc) in tools {
+    for (name, desc, schema) in tools {
         sqlx::query(
-            r#"INSERT INTO mcp_connector_tools (connector_id, tool_name, description, last_synced_at)
-               VALUES ($1, $2, $3, now())
+            r#"INSERT INTO mcp_connector_tools (connector_id, tool_name, description, input_schema, last_synced_at)
+               VALUES ($1, $2, $3, $4, now())
                ON CONFLICT (connector_id, tool_name) DO UPDATE SET
-                 description = EXCLUDED.description, last_synced_at = now()"#,
+                 description = EXCLUDED.description,
+                 input_schema = EXCLUDED.input_schema,
+                 last_synced_at = now()"#,
         )
         .bind(connector_id)
         .bind(name)
         .bind(desc)
+        .bind(schema)
         .execute(&mut *tx)
         .await?;
     }

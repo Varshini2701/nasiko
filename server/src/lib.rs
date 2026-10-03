@@ -1,6 +1,13 @@
+// Axum handlers here deliberately return `Result<T, axum::response::Response>`
+// so `?` can short-circuit with an already-built HTTP response — clippy's
+// large-Err-variant lint doesn't fit that idiom, which is used pervasively
+// across this crate's routes.
+#![allow(clippy::result_large_err)]
+
 pub mod acl;
 pub mod admin;
 pub mod admission;
+pub mod agent_lifecycle;
 pub mod agent_proxy;
 pub mod agents;
 pub mod auth;
@@ -10,16 +17,21 @@ pub mod catalog;
 pub mod chat;
 pub mod coding_agent_otlp;
 pub mod coding_agent_telemetry;
+pub mod context_selection;
 pub mod flows;
 pub mod github;
+pub mod hitl;
 pub mod llm_configs;
 pub mod llm_router;
 pub mod maf;
 pub mod mcp;
 pub mod multipart_util;
 pub mod observability;
+pub mod onboarding;
 pub mod openapi;
+pub mod orchestrator_policy;
 pub mod pool;
+pub mod prompt_context;
 pub mod rate_limit;
 pub mod registry_a2a;
 pub mod router;
@@ -27,8 +39,10 @@ pub mod runtime;
 pub mod secrets;
 pub mod seed;
 pub mod settings;
+pub mod spa;
 pub mod state;
 pub mod telemetry;
+pub mod titling;
 pub mod transcribe;
 pub mod usage;
 pub mod users;
@@ -151,12 +165,27 @@ where
             base_url: state.config.openai_base_url.clone(),
             model: state.config.openai_model.clone(),
         };
+        // The MAF worker's client makes nothing but agent A2A calls, so it
+        // carries the agent-call budget at the client level rather than
+        // repeating a per-request override at each of the executor's call
+        // sites. Its own pool, deliberately: a background worker's traffic
+        // profile has no business sharing the request path's.
+        let maf_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                state.config.agent_call_timeout_secs,
+            ))
+            .build()
+            .expect("failed to build MAF agent client");
         nasiko_orchestrator::maf::start_worker(
             state.db.clone(),
             state.redis.clone(),
-            state.http_client.clone(),
-            state.observability.clone(),
+            maf_client,
+            // The same guard the A2A dispatch and agent-proxy paths use, so a
+            // MAF step's agent call is bounded by exactly the cascade limits
+            // every other inter-agent call already is.
+            std::sync::Arc::new(state.flow_guard.clone()),
             llm_config,
+            state.hitl_store.clone(),
         );
     } else {
         tracing::warn!(
@@ -182,8 +211,11 @@ where
     // `protected`'s outer layer), no per-route role check needed.
     let pool_routes = Router::new().nest("/pool", pool::degradable_router());
 
-    // User management: superuser only
-    let user_routes = user_router.layer(middleware::from_fn(auth::rbac::require_superuser));
+    // User management: admin role or superuser.
+    let user_routes = user_router.layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth::rbac::require_user_manager,
+    ));
 
     // Agent deploy MUTATIONS (upload, restart-deployment, update/rollback):
     // deployer+ only. Reads are in `degradable_routes` below.
@@ -229,6 +261,24 @@ where
     let oci_limiter = RateLimiter::new(300, Duration::from_secs(60));
     let non_login_limiter = RateLimiter::new(30, Duration::from_secs(60));
     let registry_limiter = RateLimiter::new(60, Duration::from_secs(60));
+    // Per-caller, not global: /auth/change-password is authenticated, and it
+    // costs two bcrypt cost-12 hashes. 10/min is generous for a human changing
+    // their own password and still bounds the CPU burn from a scripted loop.
+    let change_password_limiter = RateLimiter::new(10, Duration::from_secs(60));
+    // Starting a MAF run is the single most expensive authenticated action in
+    // the product: the executor makes 4 LLM calls minimum (plan, per-step
+    // placeholder fill, per-step extraction, final synthesis) plus one agent
+    // HTTP call per step, and each of those agents makes its own LLM calls.
+    // Nothing bounded it, so a client could enqueue runs in a loop and bill
+    // the deployment for the lot. `/maf/generate` and
+    // `/maf/workflow/from-instruction` share the budget: both are LLM-backed
+    // and neither is something a human does at speed.
+    let maf_run_limiter = RateLimiter::new(10, Duration::from_secs(60));
+    // MAF's read/CRUD surface. Loose on purpose — the UI polls
+    // `/maf/execution/{id}` and `/maf/execution/{id}/usage` every couple of
+    // seconds while a workflow runs, so this has to allow steady polling and
+    // only bounds the pathological case.
+    let maf_read_limiter = RateLimiter::new(120, Duration::from_secs(60));
 
     // Public A2A registry (agent discovery) — see registry_a2a.rs for why it
     // is unauthenticated; the global fixed window bounds enumeration abuse.
@@ -251,23 +301,27 @@ where
         .merge(build_routes)
         .merge(degradable_routes)
         .merge(chat::router())
+        .merge(context_selection::router())
+        .merge(onboarding::router())
         .merge(coding_agent_telemetry::router())
-        .merge(maf::router())
+        .merge(maf::router(maf_run_limiter, maf_read_limiter))
         .merge(secrets::router())
         .merge(llm_configs::router())
         .merge(settings::router())
         .merge(llm_router::model_registry::router())
         .merge(llm_router::providers::router())
+        .merge(llm_router::custom_providers::router())
         .merge(capabilities::router())
         .merge(usage::routes::router())
         .merge(flows::router())
+        .merge(router::hitl::router())
         .nest(
             "/observability",
             observability::protected_router(state.clone()),
         )
         .merge(agents::upload::status_router())
         .merge(github::router())
-        .merge(auth::login::protected_router())
+        .merge(auth::login::protected_router(change_password_limiter))
         .merge(transcribe::router())
         .merge(mcp::router())
         .merge(mcp_upload_routes)
@@ -281,13 +335,13 @@ where
         .merge(mcp::public_api_router());
 
     // Agent-facing MCP gateway (`POST /api/mcp`) — deliberately mounted OUTSIDE
-    // `require_auth`. An agent's only credential is the short-lived delegation
-    // JWT (`agent_proxy.rs` strips the caller's real `Authorization`/`Cookie`
-    // before forwarding to a container), so this route validates that token
-    // itself via `mcp::require_delegation` instead of a user session JWT.
+    // `require_auth`. Agents authenticate with their deploy-time gateway
+    // credential (`Authorization: Bearer $MCP_GATEWAY_TOKEN`) and the user
+    // identity is resolved from the request's `traceparent` via the flow
+    // record — both validated inside the handler itself
+    // (docs/MCP_GATEWAY_AGENT_AUTH.md).
     let mcp_agent_gateway = Router::new()
         .nest("/api", mcp::agent_gateway_router())
-        .layer(middleware::from_fn(mcp::require_delegation))
         .with_state(state.clone());
 
     let oci_state = nasiko_oci::OciState::new(state.db.clone(), state.oci_storage.clone());
@@ -332,10 +386,30 @@ where
     // top level (outside `/api` and `auth::require_auth`) — it verifies the agent's
     // own identity JWT internally, not the user session. Deployed agents point their
     // SDK base URL (`LLM_GATEWAY_BASE_URL`) directly at these `/v1/...` routes.
-    let llm_routes = nasiko_llm_router::router(nasiko_llm_router::LlmRouterCtx::from_shared(
-        state.db.clone(),
-        state.http_client.clone(),
-    ));
+    let llm_ctx =
+        nasiko_llm_router::LlmRouterCtx::from_shared(state.db.clone(), state.http_client.clone());
+    // Both sync loops below read the router's effective config, resolved once here
+    // rather than re-read from env per loop.
+    let llm_cfg = llm_ctx.cfg.clone();
+    let llm_routes = nasiko_llm_router::router(llm_ctx);
+    // Keep the provider model catalog (tier-routing candidates) fresh from each
+    // provider's GET /models. Runs immediately, then every 24 h; fail-open.
+    if state.config.model_catalog_sync_enabled {
+        nasiko_llm_router::routing::catalog::spawn_sync(
+            state.db.clone(),
+            state.http_client.clone(),
+            llm_cfg.clone(),
+        );
+    }
+    // Keep model_pricing fresh from the Portkey price book (free, no-auth, MIT);
+    // curated seed rows remain the offline baseline. Daily; fail-open.
+    if state.config.model_pricing_sync_enabled {
+        nasiko_llm_router::routing::pricing_sync::spawn_sync(
+            state.db.clone(),
+            state.http_client.clone(),
+            llm_cfg,
+        );
+    }
 
     // UI pages: the static fallback is gated server-side — unauthenticated
     // page navigations get a redirect to /login.html instead of the document
@@ -345,7 +419,22 @@ where
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_page_auth,
-        ));
+        ))
+        // An /api path that reached the UI fallback matched no API route, and
+        // must not be answered with the SPA. Serving index.html here — status
+        // 200, Content-Type text/html — is what made a missing route surface in
+        // the browser as "Server returned a malformed JSON body": a real
+        // failure wearing a label that sends you at your own JSON parsing
+        // instead of at a route that is not there.
+        //
+        // Registered here rather than on the outer router because `nest("/api",
+        // …)` already owns a catch-all at that position and a second wildcard
+        // beside it panics at startup. Nothing else routes inside `ui_pages`,
+        // so there is no conflict. After `.layer()` on purpose: the page-auth
+        // redirect is for document navigations, and bouncing an API call to
+        // login.html would put HTML back in the response we are removing it
+        // from.
+        .route("/api/{*rest}", any(api_not_found));
 
     Router::new()
         .route("/health", get(health))
@@ -363,7 +452,55 @@ where
         .merge(mcp_agent_gateway)
         .fallback_service(ui_pages)
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
+        // Default span-making records the full request URI, which would publish
+        // the agent credential carried by `/api/mcp/s/{token}` into every span
+        // and log line. Redact that one route; everything else is unchanged.
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |req: &axum::http::Request<axum::body::Body>| {
+                let span = tracing::info_span!(
+                    "request",
+                    method = %req.method(),
+                    uri = %mcp::redact_credential_uri(req.uri()),
+                    version = ?req.version(),
+                );
+                // Adopt the caller's W3C trace context when it sends one, so this
+                // server span joins the flow that triggered it rather than rooting
+                // a trace of its own. Callers without a `traceparent` (a browser
+                // hitting the UI or the API) are unaffected and still start a root.
+                //
+                // Agent→server hops depend on this. The LLM router's `gen_ai.chat`
+                // span records the *resolved* provider and model, which is the only
+                // place the truth appears when an agent's config re-routes it — the
+                // agent labels its own span with the model it asked for. Rooted in a
+                // separate trace, that span is unreachable from the session view and
+                // from the span→`trace_usage` materializer, so traces and FinOps both
+                // fall back to the requested model and price the wrong one.
+                if let Some(cx) = req
+                    .headers()
+                    .get("traceparent")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(telemetry::remote_context_from_traceparent)
+                {
+                    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+                    span.set_parent(cx);
+                }
+                span
+            },
+        ))
+}
+
+/// The 404 for an unmatched `/api` path, in the envelope every other API error
+/// uses (`{data, status_code, message}`) so the frontend's error handling reads
+/// it the same way as any other failure rather than choking on HTML.
+async fn api_not_found(uri: axum::http::Uri) -> impl IntoResponse {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "data": null,
+            "status_code": 404,
+            "message": format!("no API route matches {}", uri.path()),
+        })),
+    )
 }
 
 /// State for [`authenticate_oci_request`] — bundles the two things it needs

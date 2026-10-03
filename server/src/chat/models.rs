@@ -18,6 +18,8 @@ pub struct ChatSession {
     pub agent_id: Option<Uuid>,
     pub agent_url: Option<String>,
     pub title: String,
+    /// `orchestrator` | `direct_chat` | `maf_execution` — see migration 0034.
+    pub session_type: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -29,6 +31,8 @@ pub struct ChatSessionView {
     pub agent_id: Option<Uuid>,
     pub agent_url: Option<String>,
     pub title: String,
+    /// `orchestrator` | `direct_chat` | `maf_execution` — see migration 0034.
+    pub session_type: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub agent_name: Option<String>,
@@ -60,6 +64,11 @@ pub struct ChatMessage {
     // carry at most duration/trace.
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
+    /// Prompt tokens served from the provider cache. Separate from `input_tokens`, which
+    /// carries only the fresh portion — a chip that sums input+output alone under-reports
+    /// the prompt by whatever the cache served (migration 041).
+    pub cache_read_tokens: Option<i32>,
+    pub cache_creation_tokens: Option<i32>,
     pub model: Option<String>,
     pub duration_ms: Option<i32>,
     pub cost_usd: Option<rust_decimal::Decimal>,
@@ -101,6 +110,19 @@ pub struct ChatMessageFile {
     pub created_at: DateTime<Utc>,
 }
 
+/// The only two `chat_messages.role` values a client may ever write via `POST
+/// /api/chat/sessions/{id}/messages` (`send_message`, which validates `SendMessage::role` against
+/// these). `"system"` is deliberately excluded even though it's a real, legitimate value in this
+/// column — it's written exclusively by internal server code
+/// (`router/a2a_dispatch.rs::INTERNAL_TRANSCRIPT_ROLE`, a HITL resume's own continuation note) and
+/// must never be attacker-controlled: `list_messages` hides `role = 'system'` rows from the
+/// transcript/audit UI on the assumption that nothing a human or API caller wrote can carry that
+/// role, but `SessionHistory::fetch` (`oss/orchestrator`) applies no such filter when building the
+/// next turn's LLM prompt — a client-forged `role: "system"` row would reach the model as a system
+/// instruction while staying invisible everywhere a human would look for it (found in review).
+pub const CHAT_MESSAGE_ROLE_USER: &str = "user";
+pub const CHAT_MESSAGE_ROLE_ASSISTANT: &str = "assistant";
+
 #[derive(Debug, Deserialize)]
 pub struct SendMessage {
     pub role: String,
@@ -117,6 +139,10 @@ pub struct SendMessage {
 pub struct MessageUsage {
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<i32>,
+    #[serde(default)]
+    pub cache_creation_tokens: Option<i32>,
     pub model: Option<String>,
     pub duration_ms: Option<i32>,
     pub cost_usd: Option<rust_decimal::Decimal>,

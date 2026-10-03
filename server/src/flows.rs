@@ -22,6 +22,34 @@ pub fn router() -> Router<AppState> {
         .route("/flows/{flow_id}/steps", post(add_step))
 }
 
+/// Record `agent_id` as a participant of `flow_id` — the durable fact that the
+/// flow was dispatched to this agent. Awaited (not spawned) so the row is
+/// guaranteed present before the agent container can call back into the
+/// platform.
+///
+/// LOAD-BEARING for authorization: the MCP gateway and the LLM router only
+/// serve a `tools/call` / LLM call when the authenticated agent is a recorded
+/// participant of the flow named by the request's `traceparent`
+/// (docs/MCP_GATEWAY_AGENT_AUTH.md §2.4). A missed insert here is a denial for
+/// that agent — never an escalation — but it is still an agent outage, so
+/// every dispatch path must call this alongside its `flows` insert.
+pub async fn record_participant(db: &sqlx::PgPool, flow_id: &str, agent_id: Uuid) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO flow_participants (flow_id, agent_id) VALUES ($1, $2)
+         ON CONFLICT (flow_id, agent_id) DO NOTHING",
+    )
+    .bind(flow_id)
+    .bind(agent_id)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(
+            error = %e, %flow_id, %agent_id,
+            "flow participant record failed — this agent's MCP/LLM calls in this flow will be denied"
+        );
+    }
+}
+
 // ─── Models ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, FromRow)]

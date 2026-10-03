@@ -182,9 +182,9 @@ fn optional_fields_use_defaults_when_not_set() {
         "GITHUB_CLIENT_SECRET",
         "ROUTER_SHORTLIST_THRESHOLD",
         "ROUTER_SHORTLIST_SIZE",
-        "MAX_ROUTER_HISTORY_MESSAGES",
         "EMBEDDING_MODEL",
         "ROUTER_AGENT_TIMEOUT_SECS",
+        "AGENT_CALL_TIMEOUT_SECS",
         "GITHUB_CALLBACK_URL",
         "DOCKER_AGENT_NETWORK",
         "OCI_REGISTRY_HOST",
@@ -192,6 +192,7 @@ fn optional_fields_use_defaults_when_not_set() {
         "GIT_CLONE_ALLOWED_HOSTS",
         "REGISTRY_IMPORT_ALLOWED_HOSTS",
         "ADMIN_USERNAME",
+        "BUILD_CONCURRENCY",
     ]);
 
     let cfg = Config::from_env().expect("Config::from_env() should succeed with all defaults");
@@ -235,19 +236,21 @@ fn optional_fields_use_defaults_when_not_set() {
     assert_eq!(cfg.flow_max_depth, 5);
     assert_eq!(cfg.flow_max_fan_out, 20);
     assert_eq!(cfg.flow_max_tokens, 100_000);
-    assert_eq!(cfg.flow_timeout_secs, 120);
+    assert_eq!(cfg.flow_timeout_secs, 600);
     assert_eq!(cfg.github_client_id, None);
     assert_eq!(cfg.github_client_secret, None);
     assert_eq!(cfg.router_shortlist_threshold, 15);
     assert_eq!(cfg.router_shortlist_size, 10);
-    assert_eq!(cfg.max_router_history_messages, 20);
     assert_eq!(cfg.embedding_model, "text-embedding-3-small");
-    assert_eq!(cfg.router_agent_timeout_secs, 60);
+    assert_eq!(cfg.agent_call_timeout_secs, 600);
     assert_eq!(cfg.github_callback_url, None);
     assert_eq!(cfg.docker_agent_network, None);
     assert_eq!(cfg.oci_registry_host, None);
     assert_eq!(cfg.container_hours_poll_secs, 60);
     assert_eq!(cfg.admin_username, "admin");
+    // Concurrent by default: shipping 1 here would mean every deployment keeps
+    // queuing builds serially until someone discovers the env var.
+    assert_eq!(cfg.build_concurrency, 4);
 
     // git_clone_allowed_hosts has a hardcoded default
     assert!(
@@ -349,6 +352,24 @@ fn router_shortlist_size_is_parsed_from_env() {
 
 #[test]
 #[serial]
+fn build_concurrency_is_parsed_and_clamped() {
+    set_required_vars();
+
+    for (env_value, expected) in [("2", 2), ("1", 1), ("0", 1), ("1000", 16)] {
+        unsafe { std::env::set_var("BUILD_CONCURRENCY", env_value) };
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(
+            cfg.build_concurrency, expected,
+            "BUILD_CONCURRENCY={env_value} should resolve to {expected}"
+        );
+    }
+
+    unsafe { std::env::remove_var("BUILD_CONCURRENCY") };
+    unset_required_vars();
+}
+
+#[test]
+#[serial]
 fn flow_max_depth_is_parsed_from_env() {
     set_required_vars();
     unsafe { std::env::set_var("NASIKO_FLOW_MAX_DEPTH", "10") };
@@ -375,13 +396,44 @@ fn flow_max_tokens_is_parsed_from_env() {
 
 #[test]
 #[serial]
-fn router_agent_timeout_secs_is_parsed_from_env() {
+fn agent_call_timeout_secs_is_parsed_from_env() {
     set_required_vars();
-    unsafe { std::env::set_var("ROUTER_AGENT_TIMEOUT_SECS", "120") };
+    unsafe { std::env::set_var("AGENT_CALL_TIMEOUT_SECS", "120") };
 
     let cfg = Config::from_env().unwrap();
-    assert_eq!(cfg.router_agent_timeout_secs, 120);
+    assert_eq!(cfg.agent_call_timeout_secs, 120);
 
+    unsafe { std::env::remove_var("AGENT_CALL_TIMEOUT_SECS") };
+    unset_required_vars();
+}
+
+/// The pre-rename name still works: deployments that set it keep their value
+/// rather than silently reverting to the default.
+#[test]
+#[serial]
+fn agent_call_timeout_secs_falls_back_to_the_legacy_env_name() {
+    set_required_vars();
+    unsafe { std::env::set_var("ROUTER_AGENT_TIMEOUT_SECS", "90") };
+
+    let cfg = Config::from_env().unwrap();
+    assert_eq!(cfg.agent_call_timeout_secs, 90);
+
+    unsafe { std::env::remove_var("ROUTER_AGENT_TIMEOUT_SECS") };
+    unset_required_vars();
+}
+
+/// The new name wins when both are set.
+#[test]
+#[serial]
+fn agent_call_timeout_secs_prefers_the_current_env_name() {
+    set_required_vars();
+    unsafe { std::env::set_var("AGENT_CALL_TIMEOUT_SECS", "120") };
+    unsafe { std::env::set_var("ROUTER_AGENT_TIMEOUT_SECS", "90") };
+
+    let cfg = Config::from_env().unwrap();
+    assert_eq!(cfg.agent_call_timeout_secs, 120);
+
+    unsafe { std::env::remove_var("AGENT_CALL_TIMEOUT_SECS") };
     unsafe { std::env::remove_var("ROUTER_AGENT_TIMEOUT_SECS") };
     unset_required_vars();
 }

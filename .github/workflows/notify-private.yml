@@ -1,5 +1,12 @@
 name: Notify private repo
 
+# pull_request_target, not pull_request: the latter does not have access to
+# secrets when the PR comes from a fork (which is the common case for external
+# contributors). pull_request_target runs in the context of the BASE repo, so
+# PRIVATE_REPO_PAT is available.
+#
+# This is safe because the workflow does NOT check out or execute any code from
+# the fork — it only reads PR metadata and sends a dispatch.
 on:
   pull_request_target:
     types: [opened, synchronize]

@@ -155,6 +155,73 @@ pub struct Usage {
     pub completion_tokens: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<i64>,
+    /// Prompt tokens served from the provider's cache. Anthropic reports
+    /// `cache_read_input_tokens`; OpenAI reports `prompt_tokens_details.cached_tokens`
+    /// (lifted into this flat field by [`Usage::normalize_openai_details`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<i64>,
+    /// Prompt tokens written into the provider's cache (Anthropic
+    /// `cache_creation_input_tokens`; OpenAI doesn't expose a write count).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<i64>,
+    /// Cache writes subdivided by reported TTL; never additional prompt tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreationUsage>,
+    /// OpenAI nests cache counts under `usage.prompt_tokens_details`; kept so the
+    /// flat `cache_read_input_tokens` can be filled from it after deserialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CacheCreationUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_5m_input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_1h_input_tokens: Option<i64>,
+}
+
+/// OpenAI's `usage.prompt_tokens_details` — the only place OpenAI reports cache reads.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PromptTokensDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<i64>,
+}
+
+impl Usage {
+    /// Lift OpenAI's nested `prompt_tokens_details.cached_tokens` into the flat
+    /// `cache_read_input_tokens` (no-op for Anthropic, which sets the flat field
+    /// directly), and make `prompt_tokens` count only *uncached* input.
+    ///
+    /// The second half matters for billing. `calculate_token_cost` charges
+    /// `input_tokens` at the full input rate AND `cache_read_input_tokens` at
+    /// the cache rate, then sums them — so a prompt count that still includes
+    /// cache reads is billed twice. Providers disagree on this:
+    ///
+    /// - OpenAI: `prompt_tokens` **includes** the cached tokens → subtract here.
+    /// - Anthropic: `input_tokens` already **excludes** them → nothing to do
+    ///   (it sets the flat field and never sends the nested block).
+    /// - Gemini: `promptTokenCount` **includes** them, but reports the count in
+    ///   `cachedContentTokenCount` rather than the nested block, so its adapter
+    ///   subtracts at its own mapping site (`providers/gemini.rs`).
+    ///
+    /// Subtraction is keyed on the nested block being the *source* of the
+    /// cache-read count, so an explicit flat value still wins and is never
+    /// double-counted. The block is consumed, making repeated calls a no-op.
+    pub fn normalize_openai_details(&mut self) {
+        let Some(nested) = self.prompt_tokens_details.take() else {
+            return;
+        };
+        if self.cache_read_input_tokens.is_some() {
+            return;
+        }
+        self.cache_read_input_tokens = nested.cached_tokens;
+        if let Some(cached) = nested.cached_tokens
+            && let Some(prompt) = self.prompt_tokens
+        {
+            self.prompt_tokens = Some((prompt - cached).max(0));
+        }
+    }
 }
 
 /// A streaming chunk (`chat.completion.chunk`).
@@ -217,6 +284,102 @@ pub struct FunctionCallDelta {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn openai_usage_lifts_nested_cached_tokens_into_flat_cache_read() {
+        // OpenAI reports cache reads nested under prompt_tokens_details.
+        let mut usage: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "total_tokens": 110,
+            "prompt_tokens_details": { "cached_tokens": 640 }
+        }))
+        .unwrap();
+        assert_eq!(
+            usage.cache_read_input_tokens, None,
+            "nested until normalized"
+        );
+        usage.normalize_openai_details();
+        assert_eq!(usage.cache_read_input_tokens, Some(640));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn openai_prompt_tokens_become_uncached_only() {
+        // The regression this guards: `calculate_token_cost` charges
+        // input_tokens at the full rate AND cache_read at the cache rate, so a
+        // cache-inclusive prompt count is billed twice. gpt-4o at $2.50/$1.25
+        // per 1M with 10k prompt / 8k cached was billed 10k+8k instead of
+        // 2k+8k — a ~40% overstatement.
+        let mut usage: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 10000,
+            "completion_tokens": 500,
+            "total_tokens": 10500,
+            "prompt_tokens_details": { "cached_tokens": 8000 }
+        }))
+        .unwrap();
+        usage.normalize_openai_details();
+        assert_eq!(usage.cache_read_input_tokens, Some(8000));
+        assert_eq!(
+            usage.prompt_tokens,
+            Some(2000),
+            "prompt_tokens must exclude the cached portion"
+        );
+    }
+
+    #[test]
+    fn normalize_is_idempotent_and_cannot_subtract_twice() {
+        let mut usage: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 10000,
+            "prompt_tokens_details": { "cached_tokens": 8000 }
+        }))
+        .unwrap();
+        usage.normalize_openai_details();
+        usage.normalize_openai_details();
+        assert_eq!(usage.prompt_tokens, Some(2000));
+        assert_eq!(usage.cache_read_input_tokens, Some(8000));
+    }
+
+    #[test]
+    fn anthropic_shape_prompt_tokens_are_left_alone() {
+        // Anthropic's `input_tokens` already excludes cache reads, so touching
+        // it would under-bill. It never sends the nested block.
+        let mut usage = Usage {
+            prompt_tokens: Some(2000),
+            cache_read_input_tokens: Some(8000),
+            ..Default::default()
+        };
+        usage.normalize_openai_details();
+        assert_eq!(usage.prompt_tokens, Some(2000));
+        assert_eq!(usage.cache_read_input_tokens, Some(8000));
+    }
+
+    #[test]
+    fn cached_larger_than_prompt_clamps_to_zero() {
+        // Never emit a negative token count — the cost trigger would read it
+        // as a credit against the bill.
+        let mut usage: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 100,
+            "prompt_tokens_details": { "cached_tokens": 640 }
+        }))
+        .unwrap();
+        usage.normalize_openai_details();
+        assert_eq!(usage.prompt_tokens, Some(0));
+    }
+
+    #[test]
+    fn normalize_keeps_explicit_flat_cache_read_over_nested() {
+        // Anthropic sets the flat field directly; normalization must not clobber it.
+        let mut usage = Usage {
+            cache_read_input_tokens: Some(42),
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(999),
+            }),
+            ..Default::default()
+        };
+        usage.normalize_openai_details();
+        assert_eq!(usage.cache_read_input_tokens, Some(42));
+    }
 
     #[test]
     fn parses_openai_request_with_tools_and_preserves_unknown_fields() {
@@ -319,6 +482,7 @@ mod tests {
                 prompt_tokens: Some(10),
                 completion_tokens: Some(2),
                 total_tokens: Some(12),
+                ..Default::default()
             }),
             extra: Map::new(),
         };

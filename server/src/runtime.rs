@@ -55,16 +55,23 @@ pub fn instrument<R: ContainerRuntime>(
 /// image the daemon doesn't have locally is `docker load`ed straight from
 /// registry storage, so `nasiko deploy` works against a single-node server
 /// with no `OCI_REGISTRY_HOST` (which stays supported as the pull fallback).
+///
+/// `storage` is the same `BlobStore` the composition root hands `AppState`,
+/// passed in rather than built here so both read the backend the operator
+/// actually selected - an edition that offers more than one must not have this
+/// path quietly resolve to a different store than the registry uses.
 pub async fn build_docker_runtime(
     config: &Config,
     db: sqlx::PgPool,
+    storage: std::sync::Arc<dyn nasiko_runtime::BlobStore>,
 ) -> Result<InstrumentedRuntime<InstrumentedRuntime<DockerRuntime, OtelInjector>, McpInjector>> {
-    let storage = nasiko_oci::storage::S3Storage::from_env(config.oci_storage_bucket.clone()).await;
     let image_source = std::sync::Arc::new(nasiko_oci::OciState::new(db, storage));
 
     let docker = DockerRuntime::new(DockerRuntimeConfig {
         network: config.docker_agent_network.clone(),
         registry_host: config.oci_registry_host.clone(),
+        registry_username: config.agent_registry_username.clone(),
+        registry_password: config.agent_registry_password.clone(),
         agent_memory_volume: config.agent_memory_volume.clone(),
         agent_memory_init_image: config.agent_memory_init_image.clone(),
         ..DockerRuntimeConfig::default()

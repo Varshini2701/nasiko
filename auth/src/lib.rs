@@ -66,11 +66,15 @@ pub trait AuthService: Send + Sync + 'static {
         let _ = identity;
         true
     }
-    /// May the identity manage agent secrets? (EE: ≥ team_lead)
-    async fn can_manage_secrets(&self, identity: &Identity) -> bool {
-        let _ = identity;
-        true
-    }
+    // There is deliberately no `can_manage_secrets` here. Secret access is
+    // authorized per-resource, not by role, and both surfaces already do it:
+    // `/api/secrets` is scoped to `user_secrets.user_id` and encrypted under a
+    // key derived from that id, and `/api/agents/{id}/secrets` goes through
+    // `acl::can_manage_agent` (owner or superuser — an invoke grant or a public
+    // flag must not confer secret-write). A role threshold would be strictly
+    // wider than either. One existed here for a while, called by nothing, which
+    // is worse than absent: it reads as protection while protecting nothing.
+
     /// May the identity manage users? (EE: ≥ admin)
     async fn can_manage_users(&self, identity: &Identity) -> bool {
         let _ = identity;
@@ -129,11 +133,16 @@ pub enum AuthError {
     #[error("token revoked")]
     Revoked,
     /// Bad username/access-key or wrong secret. Maps to 401.
+    /// `remaining_attempts` is `Some` when login lockout is approaching.
     #[error("invalid credentials")]
-    InvalidCredentials,
+    InvalidCredentials { remaining_attempts: Option<i32> },
     /// Account is deactivated. Maps to 401/403.
     #[error("account disabled")]
     Disabled,
+    /// Too many failed login attempts — account temporarily locked.
+    /// `retry_after_secs` is the number of seconds until the lockout expires.
+    #[error("account locked")]
+    AccountLocked { retry_after_secs: u64 },
     /// Requested user/agent/record does not exist. Maps to 404.
     #[error("not found")]
     NotFound,
@@ -157,6 +166,112 @@ pub enum AuthError {
 }
 
 // ─── Password helpers ────────────────────────────────────────────────────────
+
+/// Minimum length for a **user-chosen** password, in characters.
+pub const MIN_PASSWORD_LEN: usize = 12;
+
+/// Maximum length for a user-chosen password, in characters. NIST SP 800-63B
+/// asks verifiers to accept at least 64.
+pub const MAX_PASSWORD_LEN: usize = 64;
+
+/// bcrypt silently truncates its input at 72 bytes. Accepting a longer password
+/// would mean the tail of it never affects the hash — two different passwords
+/// sharing a 72-byte prefix would verify against each other — so it is rejected
+/// with an explicit message rather than quietly ignored. Byte-counted, not
+/// character-counted: 64 CJK characters are ~192 bytes.
+pub const MAX_PASSWORD_BYTES: usize = 72;
+
+/// Why a user-chosen password was refused.
+///
+/// Carries a stable slug so the HTTP layer can satisfy `API_CONVENTIONS.md` §2
+/// without restating the policy, and a message safe to show the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordPolicyError {
+    TooShort,
+    TooLong,
+    TooManyBytes,
+    MissingLowercase,
+    MissingUppercase,
+    MissingDigit,
+    MissingSymbol,
+}
+
+impl PasswordPolicyError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::TooShort => "password_too_short",
+            Self::TooLong => "password_too_long",
+            Self::TooManyBytes => "password_too_many_bytes",
+            Self::MissingLowercase => "password_missing_lowercase",
+            Self::MissingUppercase => "password_missing_uppercase",
+            Self::MissingDigit => "password_missing_digit",
+            Self::MissingSymbol => "password_missing_symbol",
+        }
+    }
+
+    pub fn message(self) -> String {
+        match self {
+            Self::TooShort => format!("password must be at least {MIN_PASSWORD_LEN} characters"),
+            Self::TooLong => format!("password must be at most {MAX_PASSWORD_LEN} characters"),
+            Self::TooManyBytes => {
+                format!("password must be at most {MAX_PASSWORD_BYTES} bytes")
+            }
+            Self::MissingLowercase => "password must contain a lowercase letter".into(),
+            Self::MissingUppercase => "password must contain an uppercase letter".into(),
+            Self::MissingDigit => "password must contain a digit".into(),
+            Self::MissingSymbol => {
+                "password must contain a symbol (anything that is not a letter or digit)".into()
+            }
+        }
+    }
+}
+
+/// Enforce the composition policy on a password the **user chose**.
+///
+/// Deliberately NOT applied to generated credentials. `generate_access_secret`
+/// draws from an alphanumeric + `-_` alphabet and the installer's
+/// `generate_secret` is alphanumeric only, so running either through this would
+/// reject values the platform itself minted — and would fail every cluster
+/// install, since the bootstrap `ADMIN_PASSWORD` is generated that way. Those
+/// are 143-258 bits of CSPRNG output; composition rules exist to push *human*
+/// choices off a small predictable set and buy such values nothing.
+///
+/// Character classes are Unicode-aware, so a non-Latin password is judged by
+/// the same rules rather than being rejected for lacking ASCII.
+pub fn validate_password(password: &str) -> Result<(), PasswordPolicyError> {
+    // Byte check first: it is the one limit that silently corrupts rather than
+    // merely refusing, so it should be reported even for an otherwise fine
+    // password.
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(PasswordPolicyError::TooManyBytes);
+    }
+
+    let chars = password.chars().count();
+    if chars < MIN_PASSWORD_LEN {
+        return Err(PasswordPolicyError::TooShort);
+    }
+    if chars > MAX_PASSWORD_LEN {
+        return Err(PasswordPolicyError::TooLong);
+    }
+
+    if !password.chars().any(char::is_lowercase) {
+        return Err(PasswordPolicyError::MissingLowercase);
+    }
+    if !password.chars().any(char::is_uppercase) {
+        return Err(PasswordPolicyError::MissingUppercase);
+    }
+    if !password.chars().any(|c| c.is_numeric()) {
+        return Err(PasswordPolicyError::MissingDigit);
+    }
+    // "Symbol" is defined by exclusion so every punctuation mark, currency sign
+    // and space counts — an allowlist of ASCII specials would reject a password
+    // whose only symbol is an em dash or a non-Latin punctuation mark.
+    if !password.chars().any(|c| !c.is_alphanumeric()) {
+        return Err(PasswordPolicyError::MissingSymbol);
+    }
+
+    Ok(())
+}
 
 /// Hash a password with bcrypt cost 12.
 pub fn hash_password(password: &str) -> Result<String, AuthError> {

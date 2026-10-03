@@ -569,12 +569,17 @@ fn is_markdown_heading_line(line: &str) -> bool {
 }
 
 /// Public entry point for eager tool sync (e.g. after OAuth callback).
+/// Rebuilds the search index after sync so new/changed tools are discoverable.
 pub async fn sync_connector_tools_by_id(
     state: &McpState,
     user_id: Uuid,
     connector_id: Uuid,
 ) -> Result<()> {
-    sync_connector_tools(state, user_id, connector_id).await
+    sync_connector_tools(state, user_id, connector_id).await?;
+    if let Err(e) = state.search_index.rebuild(&state.db).await {
+        tracing::warn!(error = %e, "search index rebuild after tool sync failed");
+    }
+    Ok(())
 }
 
 /// Sync a connector's tool catalog from its live backend into `mcp_connector_tools`.
@@ -597,7 +602,11 @@ async fn sync_connector_tools(state: &McpState, user_id: Uuid, connector_id: Uui
         }
     } else {
         let built = crate::credentials::build_generic_servers(state, user_id).await?;
-        match built.iter().find(|s| s.connector_id == connector_id) {
+        match built
+            .configs
+            .iter()
+            .find(|s| s.connector_id == connector_id)
+        {
             Some(cfg) => state
                 .providers
                 .mcp
@@ -664,10 +673,6 @@ async fn sync_connector_tools(state: &McpState, user_id: Uuid, connector_id: Uui
             }
         }
 
-        let tools: Vec<(String, Option<String>)> = tools
-            .into_iter()
-            .map(|(name, desc, _)| (name, desc))
-            .collect();
         repo::upsert_connector_tools(&state.db, connector_id, &tools).await?;
         // The catalog's cached tool count (catalog::cached_tool_count) would
         // otherwise keep serving whatever it saw before this sync — most

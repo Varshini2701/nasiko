@@ -100,6 +100,12 @@ pub mod codes {
     pub const TOOL_BLOCKED: i64 = -32000;
     /// Tool requires user approval (permission stance = ask).
     pub const TOOL_ASK: i64 = -32001;
+    /// Tool's connector needs the user to (re-)authenticate — the credential
+    /// is missing or no longer works (`ConnectorUnusable::AuthRequired`), as
+    /// opposed to `TOOL_BLOCKED`'s "administratively disabled". A pending
+    /// `hitl_requests` row (`kind=auth_required`) is created alongside this
+    /// response — see `protocol::handle_tools_call`.
+    pub const AUTH_REQUIRED: i64 = -32002;
 }
 
 // ─── Backend / auth descriptors ─────────────────────────────────────────────
@@ -144,6 +150,29 @@ impl AuthType {
             _ => None,
         }
     }
+}
+
+/// Why a generic connector's per-user credential is currently unusable —
+/// computed once in `credentials::build_server_config` so later stages (e.g.
+/// a future AuthRequired signal) don't have to re-derive "why", only
+/// "whether". Purely an internal signal for now: nothing outside
+/// `oss/mcp-gateway` branches on this yet, and the JSON-RPC error an agent
+/// sees is unchanged regardless of which variant applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectorUnusable {
+    /// The connector's own configuration is incomplete or invalid (no
+    /// `url`, a `url_param` connector missing `url_param_name`, or an
+    /// unrecognized `auth_type`) — not a credential problem at all.
+    NotConfigured,
+    /// No credential has ever been supplied for this user: no stored
+    /// credential/OAuth connection row, or an `oauth2` connector with no
+    /// connection at all yet.
+    MissingCredential,
+    /// A credential was supplied but no longer works — decrypt failure, or
+    /// an OAuth2 refresh that failed because the token was rejected,
+    /// revoked, expired, or the refresh request itself failed. The user
+    /// must re-authenticate.
+    AuthRequired,
 }
 
 /// The two kinds of tool backends the gateway aggregates over.
@@ -230,6 +259,8 @@ pub struct AccessReason {
     pub user_id: Uuid,
     pub username: String,
     pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub role: Option<String>,
     pub via: String,
     pub via_label: Option<String>,
 }
@@ -245,6 +276,18 @@ pub struct OrgGrantConsumer {
     pub name: String,
     pub granted_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+}
+
+/// A connector that couldn't be built into a live backend this cycle, and
+/// why — computed once in `credentials::build_generic_servers` (from
+/// [`ConnectorUnusable`]) so `tools/call`'s routing-failure path can tell
+/// "needs re-authentication" apart from "genuinely unknown tool"/"disabled",
+/// without a second connector lookup at response time.
+#[derive(Debug, Clone)]
+pub struct UnusableConnector {
+    pub reason: ConnectorUnusable,
+    /// Display/log label only — mirrors [`MCPServerConfig::name`].
+    pub name: String,
 }
 
 /// A resolved backend the gateway will fan out to. The Composio session (when
@@ -393,6 +436,22 @@ mod tests {
         assert_eq!(
             name.split_once("__"),
             Some(("abcdef0022223333", "SEND_EMAIL"))
+        );
+    }
+
+    #[test]
+    fn connector_unusable_variants_are_distinguishable() {
+        assert_ne!(
+            ConnectorUnusable::NotConfigured,
+            ConnectorUnusable::MissingCredential
+        );
+        assert_ne!(
+            ConnectorUnusable::MissingCredential,
+            ConnectorUnusable::AuthRequired
+        );
+        assert_ne!(
+            ConnectorUnusable::NotConfigured,
+            ConnectorUnusable::AuthRequired
         );
     }
 

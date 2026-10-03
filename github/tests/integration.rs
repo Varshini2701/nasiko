@@ -252,8 +252,12 @@ async fn t06_verify_token_invalid() {
         }
     };
 
+    // Hyphenated on purpose. GitHub 401s anything here, so the value is
+    // arbitrary — but a well-formed `ghp_` + 36 alphanumerics matches the
+    // publish gate's token pattern (scripts/lib/oss-paths.sh), which fails
+    // closed and would abort the OSS sync the next time this file changes.
     let valid = svc
-        .verify_token("ghp_thisisnotarealtokenxxxxxxxxxxxxxxxxxx")
+        .verify_token("ghp_not-a-real-token-only-here-to-assert-401")
         .await
         .expect("verify_token should return Ok(false) on 401, not Err");
 
